@@ -1,0 +1,13 @@
+# ROS2 / colcon
+build/
+install/
+log/
+# IDE
+.idea/
+**/cmake-build-*/
+*.user
+# Python
+__pycache__/
+*.pyc
+# misc
+*.log
