@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
 #include <iostream>
+#include "localPlanners/CollisionChecking.hpp"
 
 namespace Antipatrea {
     void MPPIPlanner::updateRobotState() {
@@ -527,77 +528,11 @@ namespace Antipatrea {
         return trajectory;
     }
 
-    bool MPPIPlanner::invertMatrix(std::vector<std::vector<double> > &mat) {
-        int n = mat.size();
-        std::vector<std::vector<double> > identity(n, std::vector<double>(n, 0.0));
-        for (int i = 0; i < n; ++i) identity[i][i] = 1.0;
-
-        for (int i = 0; i < n; ++i) {
-            double diag = mat[i][i];
-            if (std::abs(diag) < 1e-8) return false; // 检查是否可逆
-
-            for (int j = 0; j < n; ++j) {
-                mat[i][j] /= diag;
-                identity[i][j] /= diag;
-            }
-
-            for (int k = 0; k < n; ++k) {
-                if (k == i) continue;
-                double factor = mat[k][i];
-                for (int j = 0; j < n; ++j) {
-                    mat[k][j] -= factor * mat[i][j];
-                    identity[k][j] -= factor * identity[i][j];
-                }
-            }
-        }
-        mat = identity;
-        return true;
-    }
-
-    std::vector<double> MPPIPlanner::calculateSGCoefficients(int window_size, int poly_order) {
-        if (window_size % 2 == 0 || poly_order >= window_size) {
-            throw std::invalid_argument("Window size must be odd and greater than polynomial order.");
-        }
-
-        int half_window = window_size / 2;
-
-
-        std::vector<std::vector<double> > A(window_size, std::vector<double>(poly_order + 1, 0.0));
-        for (int i = -half_window; i <= half_window; ++i) {
-            for (int j = 0; j <= poly_order; ++j) {
-                A[i + half_window][j] = pow(i, j);
-            }
-        }
-
-        std::vector<std::vector<double> > ATA(poly_order + 1, std::vector<double>(poly_order + 1, 0.0));
-        for (int i = 0; i <= poly_order; ++i) {
-            for (int j = 0; j <= poly_order; ++j) {
-                for (int k = 0; k < window_size; ++k) {
-                    ATA[i][j] += A[k][i] * A[k][j];
-                }
-            }
-        }
-
-        if (!invertMatrix(ATA)) {
-            throw std::runtime_error("Matrix inversion failed. Check input parameters.");
-        }
-
-        std::vector<double> coefficients(window_size, 0.0);
-        for (int i = 0; i < window_size; ++i) {
-            for (int j = 0; j <= poly_order; ++j) {
-                coefficients[i] += ATA[j][0] * A[i][j];
-            }
-        }
-
-        return coefficients;
-    }
-
 
     std::vector<double> MPPIPlanner::savitzkyGolayFilter(const std::vector<double> &data, int window_size,
                                                             int poly_order) {
         (void)poly_order;
         std::vector<double> coefficients = {-0.0952, 0.1429, 0.2857, 0.3333, 0.2857, 0.1429, -0.0952};
-        //std::vector<double> coefficients = calculateSGCoefficients(window_size, poly_order);
         int half_window = window_size / 2;
 
         std::vector<double> smoothed_data(data.size(), 0.0);
@@ -681,24 +616,6 @@ namespace Antipatrea {
         }
     }
 
-    double MPPIPlanner::calculateTheta(const PoseState &state, const double *y) {
-        double deltaX = y[0] - state.x_;
-        double deltaY = y[1] - state.y_;
-        double theta = atan2(deltaY, deltaX);
-
-        double normalizedTheta = normalizeAngle(state.theta_);
-
-        return normalizeAngle(theta - normalizedTheta);
-    }
-
-    double MPPIPlanner::normalizeAngle(double a) {
-        a = fmod(a + M_PI, 2 * M_PI);
-        if (a <= 0)
-            a += 2 * M_PI;
-
-        return a - M_PI;
-    }
-
     double MPPIPlanner::calc_to_goal_cost(const std::vector<PoseState> &traj) {
         if (use_goal_cost_ == false)
             return 0.0;
@@ -719,20 +636,6 @@ namespace Antipatrea {
         return fabs(theta);
     }
 
-    double MPPIPlanner::calc_angular_velocity(const std::vector<PoseState> &traj) {
-        if (use_angular_cost_) {
-            double angular_velocity = std::abs(traj.front().angular_velocity_);
-            double angular_velocity_cost = angular_velocity * angular_velocity;
-            return angular_velocity_cost;
-        }
-        return 0.0;
-    }
-
-    bool MPPIPlanner::isBoxIntersectingBox(const RobotBox &bbox1, const std::vector<double> &obs) {
-        return !(bbox1.x_max < obs[0] || bbox1.x_min > obs[0] ||
-                 bbox1.y_max < obs[1] || bbox1.y_min > obs[1]);
-    }
-
     void MPPIPlanner::getTrajBySavitzkyGolayFilter(std::pair<std::vector<PoseState>, std::vector<PoseState>> &trajectories) {
         std::vector<double> x;
         std::vector<double> y;
@@ -745,14 +648,6 @@ namespace Antipatrea {
         for (int i = 0; i < (int)trajectories.first.size(); i++) {
             trajectories.first[i].x_ = x_[i];
             trajectories.first[i].y_ = y_[i];
-        }
-    }
-
-    double MPPIPlanner::updateVelocity(double current, double target, double maxAccel, double minAccel, double t) {
-        if (current < target) {
-            return std::min(current + maxAccel * t, target);
-        } else {
-            return std::max(current + minAccel * t, target);
         }
     }
 
@@ -869,26 +764,12 @@ namespace Antipatrea {
     double MPPIPlanner::calculateDistanceToCarEdge(
         double carX, double carY, double cosTheta, double sinTheta,
         double halfLength, double halfWidth, const std::vector<double>& obs) {
-
-        double relX = obs[0] - carX;
-        double relY = obs[1] - carY;
-
-        double localX = relX * cosTheta - relY * sinTheta;
-        double localY = relX * sinTheta + relY * cosTheta;
-
-        double dx = std::max(std::abs(localX) - halfLength, 0.0);
-        double dy = std::max(std::abs(localY) - halfWidth, 0.0);
-
-        return std::sqrt(dx * dx + dy * dy);
+        // 委托到共享实现。本 planner 的旋转约定 sin 号与 DDP 相反，传入 -sinTheta 即
+        // 与原公式逐字等价(已代数验证)，行为不变。
+        return collision::boxEdgeDistance(carX, carY, cosTheta, -sinTheta, halfLength, halfWidth, obs);
     }
 
 
-    MPPIPlanner::RobotBox::RobotBox() : x_min(0.0), x_max(0.0), y_min(0.0), y_max(0.0) {
-    }
-
-    MPPIPlanner::RobotBox::RobotBox(double x_min_, double x_max_, double y_min_, double y_max_)
-        : x_min(x_min_), x_max(x_max_), y_min(y_min_), y_max(y_max_) {
-    }
 
     MPPIPlanner::Cost MPPIPlanner::evaluate_trajectory(
         std::pair<std::vector<PoseState>, std::vector<PoseState> > &trajectory,
@@ -922,26 +803,6 @@ namespace Antipatrea {
         return cost;
     }
 
-    MPPIPlanner::Cost::Cost() : obs_cost_(0.0), to_goal_cost_(0.0), speed_cost_(0.0), path_cost_(0.0),
-                                   ori_cost_(0.0), aw_cost_(0.0), total_cost_(0.0) {
-    }
-
-    MPPIPlanner::Cost::Cost(
-        const double obs_cost, const double to_goal_cost, const double speed_cost, const double path_cost,
-        const double ori_cost, const double aw_cost, const double total_cost)
-        : obs_cost_(obs_cost), to_goal_cost_(to_goal_cost), speed_cost_(speed_cost), path_cost_(path_cost),
-          ori_cost_(ori_cost), aw_cost_(aw_cost), total_cost_(total_cost) {
-    }
-
-    void MPPIPlanner::Cost::calc_total_cost() {
-        total_cost_ = obs_cost_ + to_goal_cost_ + speed_cost_ + path_cost_ + ori_cost_;
-    }
-
-    
-
-    MPPIPlanner::Window::Window() : min_velocity_(0.0), max_velocity_(0.0), min_angular_velocity_(0.0),
-                                       max_angular_velocity_(0.0) {
-    }
 
     MPPIPlanner::Window MPPIPlanner::calc_dynamic_window(PoseState &state, double dt) {
         Window window;

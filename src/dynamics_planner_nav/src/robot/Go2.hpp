@@ -34,6 +34,7 @@
 
 // Utils
 #include "../utils/AsyncTaskExecutor.hpp"
+#include "Go2_footprint.hpp"
 
 // Forward declarations
 class Go2Callbacks;
@@ -179,25 +180,23 @@ public:
     Footprint getFootprint() const;
     VelocityLimits getVelocityLimits() const;
 
+    // 机器人物理体积(几何模型)：优先返回预测模型从 /predicted_footprint 发来的
+    // 体积；没收到时回退到与 getFootprint() 一致的预设(BACKWARD/非激光态用点质量，
+    // 否则用 ROBOT_LENGTH x ROBOT_WIDTH 的矩形)。供 DDP 等做精细碰撞查询用。
+    go2::Footprint getRobotVolume() const;
+
     // In ROS2, costmap access pattern is different
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> getCostMapROS() { return costmap_ros_; }
 
     bool setup();
     bool checkGazeboPaused() const;
 
-    void triggerRecovery();
-    void resetStoppedStatus();
-    void update_angular_velocity();
-
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr Control() { return cmd_vel_pub_; }
     void publishRobotState() const;
-    void publishSmoothedPath(const std::vector<double> &xhat, const std::vector<double> &yhat) const;
-    void publishTuningParams() const;
 
     void view_Goal(std::vector<double> &goal, std::vector<double> &goal1) const;
     void viewTrajectories(std::vector<PoseState> &trajectories, int nr_steps_, double theta_, std::vector<double> &t) const;
     void viewTrajectories(std::vector<PoseState> &trajectories, int nr_steps_, std::vector<double> &t) const;
-    void viewObstacles() const;
 
     static double calculateTheta(const PoseState &state, const std::vector<double> &y);
 
@@ -207,6 +206,11 @@ public:
 
     bool local_goal_received{};
     bool global_goal_received{};
+    // 到达 global goal 后锁存为 true：停止规划，避免狗在目标附近一直打转。
+    // 仅在 path_goal_mutex_ 保护下读写（odometryCallback 置位 / processValidGlobalPath 读取 /
+    // goalCallback 收到新目标时复位）。
+    bool goal_reached{false};
+    double goal_reached_threshold{1.0};  // 到达判定半径(米)
     bool param_received{};
     bool canBeSolved{};
 
@@ -269,14 +273,15 @@ public:
     // ROS2 Publishers
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr global_path_pub_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr smoothed_global_path_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr local_goal_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr global_goal_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr tuning_params_pub_;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obstacles_pub_;
 
     std::shared_ptr<Go2Callbacks> callbacks_;
     std::shared_ptr<AsyncTaskExecutor> async_executor_;
+
+    // 预测体积接收器：订阅 /predicted_footprint，实时接收模型预测的机器人体积。
+    // 未来你的预测模型往该话题发 Float64MultiArray 即可，没发布者也不影响运行。
+    std::unique_ptr<go2::FootprintReceiver> footprint_receiver_;
 
 protected:
     // Thread safety
@@ -330,8 +335,11 @@ protected:
     // Constants
     static constexpr double MIN_SPEED = 0.2;
     static constexpr double STOPPED_TIME_THRESHOLD = 1.0;
-    static constexpr double ROBOT_LENGTH = 0.508;
-    static constexpr double ROBOT_WIDTH = 0.430;
+    // Unitree Go2 机身约 0.70m x 0.31m；这里取与 nav2 footprint 一致的带裕度对称尺寸
+    // 0.72m(长) x 0.36m(宽)，保证 DDP 碰撞盒子与 costmap footprint 统一。
+    // （原值 0.508 x 0.430 是 Jackal 小车的尺寸，已更正。）
+    static constexpr double ROBOT_LENGTH = 0.72;
+    static constexpr double ROBOT_WIDTH = 0.36;
     static constexpr double POINT_MASS_LENGTH = 0.02;
     static constexpr double POINT_MASS_WIDTH = 0.02;
 };

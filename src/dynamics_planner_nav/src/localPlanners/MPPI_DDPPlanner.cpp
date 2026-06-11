@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <rclcpp/rclcpp.hpp>
 #include <iostream>
+#include "localPlanners/CollisionChecking.hpp"
 
 namespace Antipatrea {
     void DDPMPPIPlanner::updateRobotState() {
@@ -623,25 +624,6 @@ namespace Antipatrea {
         }
     }
 
-    double DDPMPPIPlanner::calculateTheta(const PoseState &state, const double *y) {
-        double deltaX = y[0] - state.x_;
-        double deltaY = y[1] - state.y_;
-        double theta = atan2(deltaY, deltaX);
-
-        double normalizedTheta = normalizeAngle(state.theta_);
-
-        return normalizeAngle(theta - normalizedTheta);
-    }
-
-    double DDPMPPIPlanner::normalizeAngle(double a) {
-        a = fmod(a + M_PI, 2 * M_PI);
-        if (a <= 0)
-            a += 2 * M_PI;
-
-        return a - M_PI;
-    }
-
-
     double DDPMPPIPlanner::calc_to_goal_cost(const std::vector<PoseState> &traj) {
         if (use_goal_cost_ == false)
             return 0.0;
@@ -664,23 +646,6 @@ namespace Antipatrea {
             return 0.0;
         double theta = calculateTheta(traj[traj.size() - 1], &local_goal[0]);
         return fabs(theta);
-    }
-
-    double DDPMPPIPlanner::calc_angular_velocity(const std::vector<PoseState> &traj) {
-        if (use_angular_cost_) {
-            double angular_velocity = std::abs(traj.front().angular_velocity_);
-            double angular_velocity_cost = angular_velocity * angular_velocity;
-            return angular_velocity_cost;
-        }
-        return 0.0;
-    }
-
-    double DDPMPPIPlanner::updateVelocity(double current, double target, double maxAccel, double minAccel, double t) {
-        if (current < target) {
-            return std::min(current + maxAccel * t, target);
-        } else {
-            return std::max(current + minAccel * t, target);
-        }
     }
 
     void DDPMPPIPlanner::motion(PoseState &state, const double velocity, const double angular_velocity, double t) {
@@ -797,26 +762,12 @@ namespace Antipatrea {
     double DDPMPPIPlanner::calculateDistanceToCarEdge(
         double carX, double carY, double cosTheta, double sinTheta,
         double halfLength, double halfWidth, const std::vector<double>& obs) {
-
-        double relX = obs[0] - carX;
-        double relY = obs[1] - carY;
-
-        double localX = relX * cosTheta - relY * sinTheta;
-        double localY = relX * sinTheta + relY * cosTheta;
-
-        double dx = std::max(std::abs(localX) - halfLength, 0.0);
-        double dy = std::max(std::abs(localY) - halfWidth, 0.0);
-
-        return std::sqrt(dx * dx + dy * dy);
+        // 委托到共享实现。本 planner 的旋转约定 sin 号与 DDP 相反，传入 -sinTheta 即
+        // 与原公式逐字等价(已代数验证)，行为不变。
+        return collision::boxEdgeDistance(carX, carY, cosTheta, -sinTheta, halfLength, halfWidth, obs);
     }
 
 
-    DDPMPPIPlanner::RobotBox::RobotBox() : x_min(0.0), x_max(0.0), y_min(0.0), y_max(0.0) {
-    }
-
-    DDPMPPIPlanner::RobotBox::RobotBox(double x_min_, double x_max_, double y_min_, double y_max_)
-        : x_min(x_min_), x_max(x_max_), y_min(y_min_), y_max(y_max_) {
-    }
 
     DDPMPPIPlanner::Cost DDPMPPIPlanner::evaluate_trajectory(
         std::pair<std::vector<PoseState>, std::vector<PoseState> > &trajectory,
@@ -851,26 +802,6 @@ namespace Antipatrea {
         return cost;
     }
 
-    DDPMPPIPlanner::Cost::Cost() : obs_cost_(0.0), to_goal_cost_(0.0), speed_cost_(0.0), path_cost_(0.0),
-                                   ori_cost_(0.0), aw_cost_(0.0), total_cost_(0.0) {
-    }
-
-    DDPMPPIPlanner::Cost::Cost(
-        const double obs_cost, const double to_goal_cost, const double speed_cost, const double path_cost,
-        const double ori_cost, const double aw_cost, const double total_cost)
-        : obs_cost_(obs_cost), to_goal_cost_(to_goal_cost), speed_cost_(speed_cost), path_cost_(path_cost),
-          ori_cost_(ori_cost), aw_cost_(aw_cost), total_cost_(total_cost) {
-    }
-
-    void DDPMPPIPlanner::Cost::calc_total_cost() {
-        total_cost_ = obs_cost_ + to_goal_cost_ + speed_cost_ + path_cost_ + ori_cost_;
-    }
-
-    
-
-    DDPMPPIPlanner::Window::Window() : min_velocity_(0.0), max_velocity_(0.0), min_angular_velocity_(0.0),
-                                       max_angular_velocity_(0.0) {
-    }
 
     DDPMPPIPlanner::Window DDPMPPIPlanner::calc_dynamic_window(PoseState &state, double dt) {
         Window window;

@@ -140,7 +140,7 @@ def generate_launch_description():
         parameters=[{
             'target_frame': 'base_link',
             'transform_tolerance': 0.1,
-            'min_height': 0.2,
+            'min_height': -0.2,
             'max_height': 1.0,
             'angle_min': -3.14159,
             'angle_max': 3.14159,

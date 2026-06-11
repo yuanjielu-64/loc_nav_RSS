@@ -1,6 +1,7 @@
 #include "localPlanners/DDP.hpp"
 #include "utils/Algebra.hpp"
 #include "utils/Timer.hpp"
+#include "localPlanners/CollisionChecking.hpp"
 #include <iomanip>
 
 namespace Antipatrea {
@@ -11,7 +12,11 @@ namespace Antipatrea {
         auto time_interval_snapshot = robot->getTimeIntervalSafe();
 
         current_vel = current_state.velocity_;
-        parent = {0, 0, 0, current_state.velocity_, current_state.angular_velocity_, true};
+        // parent 必须用机器人真实 odom 位姿作为轨迹起点：障碍物(laserData)、global_paths、
+        // local_goal 全是 odom 帧，若 parent={0,0,0} 则轨迹是"机器人在原点"的本体系，
+        // 代价函数(obs/path/goal)拿本体系轨迹去比 odom 数据，只有机器人真在原点时才正确。
+        parent = {current_state.x_, current_state.y_, current_state.theta_,
+                  current_state.velocity_, current_state.angular_velocity_, true};
         parent_odom = current_state;
         timeInterval = time_interval_snapshot;
     }
@@ -48,7 +53,15 @@ namespace Antipatrea {
 
         normalParameters(*robot);
 
-        const double angle_to_goal = calculateTheta(parent, &robot->getGlobalGoalCfg()[0]);
+        // 防御：还没收到 /goal_pose 时 global_goal 为空，访问 [0] 会段错误。
+        // 没有全局目标就原地不动，等目标到达。
+        auto global_goal = robot->getGlobalGoalCfg();
+        if (global_goal.size() < 2) {
+            publishCommand(cmd_vel, 0.0, 0.0);
+            return true;
+        }
+
+        const double angle_to_goal = calculateTheta(parent, &global_goal[0]);
 
         double angular = std::clamp(angle_to_goal, -1.0, 1.0);
         angular = (angular > 0) ? std::max(angular, 0.1) : std::min(angular, -0.1);
@@ -65,6 +78,12 @@ namespace Antipatrea {
         auto result = ddp_planning(parent, parent_odom, best_traj, dt);
 
         robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
+
+        // 防御：ddp_planning 失败(代价全无效)时 best_traj.first 可能为空，访问 [3] 会段错误。
+        if (best_traj.first.size() <= 3) {
+            publishCommand(cmd_vel, 0.0, 0.0);
+            return true;
+        }
 
         if (result == false) {
             publishCommand(cmd_vel, best_traj.first[3].velocity_ / 2, best_traj.first[3].angular_velocity_ / 2);
@@ -84,7 +103,7 @@ namespace Antipatrea {
 
         robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
 
-        if (!result) {
+        if (!result || best_traj.first.size() <= 3) {
             publishCommand(cmd_vel, -0.0001, 0);
         } else
             publishCommand(cmd_vel, best_traj.first[3].velocity_, best_traj.first[3].angular_velocity_);
@@ -639,31 +658,6 @@ namespace Antipatrea {
         }
     }
 
-    double DDP::calculateTheta(const PoseState &state, const double *y) {
-        double deltaX = y[0] - state.x_;
-        double deltaY = y[1] - state.y_;
-        double theta = atan2(deltaY, deltaX);
-
-        double normalizedTheta = normalizeAngle(state.theta_);
-
-        return normalizeAngle(theta - normalizedTheta);
-    }
-
-    double DDP::normalizeAngle(double angle) {
-        angle = fmod(angle + M_PI, 2 * M_PI);
-        if (angle <= 0)
-            angle += 2 * M_PI;
-        return angle - M_PI;
-    }
-
-    double DDP::updateVelocity(double current, double target, double maxAccel, double minAccel, double t) {
-        if (current < target) {
-            return std::min(current + maxAccel * t, target);
-        } else {
-            return std::max(current + minAccel * t, target);
-        }
-    }
-
     void DDP::motion(PoseState &state, const double velocity, const double angular_velocity, double t) const {
         double v = updateVelocity(state.velocity_, velocity, maxAccelerSpeed, minAccelerSpeed, t);
         double w = updateVelocity(state.angular_velocity_, angular_velocity, maxAngularAccelerSpeed,
@@ -682,15 +676,6 @@ namespace Antipatrea {
         if (!use_speed_cost_)
             return 0.0;
         return std::abs(current_vel - traj[3].velocity_);
-    }
-
-    double DDP::calc_angular_velocity(const std::vector<PoseState> &traj) const {
-        if (use_angular_cost_) {
-            double angular_velocity = std::abs(traj.front().angular_velocity_);
-            double angular_velocity_cost = angular_velocity * angular_velocity;
-            return angular_velocity_cost;
-        }
-        return 0.0;
     }
 
     double DDP::calc_to_goal_cost(const std::vector<PoseState> &traj) {
@@ -858,80 +843,15 @@ namespace Antipatrea {
         return cost;
     }
 
-    double DDP::calc_obs_cost(const std::vector<PoseState> &traj) {
-        auto obss = robot->getDataMap();
-        // Thread-safe read: get laser distance snapshot
-        auto distances = robot->getLaserDataDistanceSafe();
-        bool flag = (distances.size() == obss.size());
-        auto footprint = robot->getFootprint();
-        auto velocity = robot->getVelocityLimits();
-        double v = velocity.max_linear;
-
-        double halfLength = footprint.length / 2.0;
-        double halfWidth = footprint.width / 2.0;
-
-        double min_dist = obs_range_;
-        double radius = robot_radius_;
-
-        for (size_t i = 0; i < traj.size() - 1; ++i) {
-            double cosTheta = std::cos(-traj[i].theta_);
-            double sinTheta = std::sin(-traj[i].theta_);
-
-            for (auto &obs: obss) {
-                double dist;
-
-                double d = std::hypot(traj[i].x_ - obs[0], traj[i].y_ - obs[1]);
-
-                if (flag && d >= v / 2)
-                    dist = d - 0.33;
-                else
-                    dist = calculateDistanceToCarEdge(traj[i].x_, traj[i].y_, cosTheta, sinTheta, halfLength, halfWidth,
-                                                      obs) - radius;
-
-                if (dist < DBL_EPSILON) {
-                    return 1e6;
-                }
-
-                min_dist = std::min(min_dist, dist);
-            }
-        }
-
-        double cost;
-        if (min_dist < 0.1) {
-            cost = 1.0 / std::pow(min_dist + 1e-6, 2);
-
-            if (cost >= 1e6)
-                return 1e6;
-        } else if (min_dist >= 0.1 && min_dist < 1) {
-            cost = obs_range_ - min_dist + 3 / min_dist;
-        } else
-            cost = 0;
-
-        return cost;
-    }
-
     double DDP::calculateDistanceToCarEdge(
         double carX, double carY, double cosTheta, double sinTheta,
         double halfLength, double halfWidth, const std::vector<double> &obs) {
-        double relX = obs[0] - carX;
-        double relY = obs[1] - carY;
-
-        double localX = relX * cosTheta + relY * sinTheta;
-        double localY = -relX * sinTheta + relY * cosTheta;
-
-        double dx = std::max(std::abs(localX) - halfLength, 0.0);
-        double dy = std::max(std::abs(localY) - halfWidth, 0.0);
-
-        return std::sqrt(dx * dx + dy * dy);
+        // 委托到共享实现(collision::boxEdgeDistance)，公式与原先逐字一致，行为不变。
+        // 这是去重的第一步：7 个 planner 的同款盒子距离将逐步统一到这一处。
+        return collision::boxEdgeDistance(carX, carY, cosTheta, sinTheta, halfLength, halfWidth, obs);
     }
 
 
-    DDP::RobotBox::RobotBox() : x_min(0.0), x_max(0.0), y_min(0.0), y_max(0.0) {
-    }
-
-    DDP::RobotBox::RobotBox(double x_min_, double x_max_, double y_min_, double y_max_)
-        : x_min(x_min_), x_max(x_max_), y_min(y_min_), y_max(y_max_) {
-    }
 
     DDP::Cost DDP::evaluate_trajectory(
         std::pair<std::vector<PoseState>, std::vector<PoseState> > &trajectory,
@@ -952,62 +872,6 @@ namespace Antipatrea {
         return cost;
     }
 
-    DDP::Cost DDP::evaluate_trajectory(std::vector<PoseState> &trajectory,
-                                       double &dist, std::vector<double> &last_position) {
-        (void)dist;
-        (void)last_position;
-        Cost cost;
-        double t = 0.0;
-
-        cost.to_goal_cost_ = calc_to_goal_cost(trajectory);
-        cost.obs_cost_ = calc_obs_cost(trajectory, t);
-        cost.space_cost_ = t;
-        cost.speed_cost_ = calc_speed_cost(trajectory);
-        cost.path_cost_ = calc_path_cost(trajectory);
-        cost.ori_cost_ = calc_ori_cost(trajectory);
-        cost.aw_cost_ = calc_angular_velocity(trajectory);
-        cost.calc_total_cost();
-        return cost;
-    }
-
-    DDP::Cost::Cost() : obs_cost_(0.0), to_goal_cost_(0.0), speed_cost_(0.0), path_cost_(0.0),
-                        ori_cost_(0.0), aw_cost_(0.0), space_cost_(0.0), total_cost_(0.0) {
-    }
-
-    DDP::Cost::Cost(
-        const double obs_cost, const double to_goal_cost, const double speed_cost, const double path_cost,
-        const double ori_cost, const double aw_cost, const double space_cost, const double total_cost)
-        : obs_cost_(obs_cost), to_goal_cost_(to_goal_cost), speed_cost_(speed_cost), path_cost_(path_cost),
-          ori_cost_(ori_cost), aw_cost_(aw_cost), space_cost_(space_cost), total_cost_(total_cost) {
-    }
-
-    void DDP::Cost::show() const {
-        std::cout << "[INFO] Cost: " << total_cost_ << std::endl;
-        std::cout << "[INFO] \tObs cost: " << obs_cost_ << std::endl;
-        std::cout << "[INFO] \tGoal cost: " << to_goal_cost_ << std::endl;
-        std::cout << "[INFO] \tSpeed cost: " << speed_cost_ << std::endl;
-        std::cout << "[INFO] \tPath cost: " << path_cost_ << std::endl;
-        std::cout << "[INFO] \tOri cost: " << ori_cost_ << std::endl;
-        std::cout << "[INFO] \tSpace cost: " << space_cost_ << std::endl;
-    }
-
-    void DDP::Cost::calc_total_cost() {
-        total_cost_ = obs_cost_ + to_goal_cost_ + speed_cost_ + path_cost_ + ori_cost_ + space_cost_;
-    }
-
-    void DDP::Window::show() const {
-        std::cout << "[INFO] Window:" << std::endl;
-        std::cout << "[INFO] \tVelocity:" << std::endl;
-        std::cout << "[INFO] \t\tmax: " << max_velocity_ << std::endl;
-        std::cout << "[INFO] \t\tmin: " << min_velocity_ << std::endl;
-        std::cout << "[INFO] \tYawrate:" << std::endl;
-        std::cout << "[INFO] \t\tmax: " << max_angular_velocity_ << std::endl;
-        std::cout << "[INFO] \t\tmin: " << min_angular_velocity_ << std::endl;
-    }
-
-    DDP::Window::Window() : min_velocity_(0.0), max_velocity_(0.0), min_angular_velocity_(0.0),
-                            max_angular_velocity_(0.0) {
-    }
 
     DDP::Window DDP::calc_dynamic_window(PoseState &state, double dt) const {
         Window window;

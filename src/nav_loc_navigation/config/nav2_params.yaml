@@ -65,7 +65,9 @@ local_costmap:
       width: 6
       height: 6
       resolution: 0.05
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
+      # Go2 机身约 0.70x0.31m，按对称矩形(以 base_link 为中心)近似，
+      # 留腿摆动/安全裕度 -> 0.72x0.36m。外接半径约 0.40m。
+      footprint: "[ [0.36, 0.18], [0.36, -0.18], [-0.36, -0.18], [-0.36, 0.18] ]"
       plugins: ["voxel_layer", "inflation_layer"]
 
       voxel_layer:
@@ -87,29 +89,36 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        # 外接半径约 0.40m + ~10cm 裕度 = 0.50（兼顾安全与钻缝能力）
+        inflation_radius: 0.50
 
 global_costmap:
   global_costmap:
     ros__parameters:
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      update_frequency: 10.0
+      publish_frequency: 5.0
       transform_tolerance: 0.5
       global_frame: odom
       robot_base_frame: base_link
       use_sim_time: false
       rolling_window: true
-      width: 40
-      height: 40
-      resolution: 0.05
+      # 窗口从 40x40 缩到 14x14：odom 帧里里程计会漂移，大窗口会让旧障碍
+      # 一直累积、拖影、清不掉（截图里糊成一片的原因）。缩小窗口让远处的
+      # 陈旧杂点随窗口滚出而丢弃，只保留近处可靠障碍，/plan 更干净。
+      width: 20
+      height: 20
+      resolution: 0.10
       track_unknown_space: false
-      footprint: "[ [0.360, 0.200], [0.360, -0.200], [-0.450, -0.200], [-0.450, 0.200] ]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      # Go2 机身约 0.70x0.31m，按对称矩形(以 base_link 为中心)近似，
+      # 留腿摆动/安全裕度 -> 0.72x0.36m。外接半径约 0.40m。
+      footprint: "[ [0.36, 0.18], [0.36, -0.18], [-0.36, -0.18], [-0.36, 0.18] ]"
+      # 单线 2D 激光用 ObstacleLayer 而非 VoxelLayer：射线穿过即清除 2D 栅格，
+      # 清障更彻底；VoxelLayer 是给 3D 用的，单线扫描下容易残留旧障碍。
+      plugins: ["obstacle_layer", "inflation_layer"]
 
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: True
         observation_sources: scan
         scan:
           topic: /front/scan
@@ -117,15 +126,18 @@ global_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
-          raytrace_max_range: 18.0
+          # 缩短量程：远处(16m)用噪声单线激光标障碍且清不干净，会留永久杂点。
+          # 只标近处可靠障碍(4.5m)，清障范围(6m)略大于标记范围以保证能清掉。
+          raytrace_max_range: 6.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 16.0
+          obstacle_max_range: 4.5
           obstacle_min_range: 0.0
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        # 外接半径约 0.40m + ~10cm 裕度 = 0.50（兼顾安全与钻缝能力）
+        inflation_radius: 0.60
 
 planner_server:
   ros__parameters:

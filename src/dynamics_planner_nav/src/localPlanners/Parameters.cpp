@@ -10,23 +10,8 @@
 
 namespace Antipatrea {
 
-    // Helper function to set common parameters for all planners
-    static void setCommonPlannerParameters(Robot_config &robot, double &dt,
-                                          double &minAccelerSpeed, double &maxAccelerSpeed,
-                                          double &minAngularAccelerSpeed, double &maxAngularAccelerSpeed) {
-        const auto tp = robot.getTuningParams();
-        dt = tp.dt;
-        minAccelerSpeed = -20.0;
-        maxAccelerSpeed = 20.0;
-        minAngularAccelerSpeed = -25;
-        maxAngularAccelerSpeed = 25;
-    }
-
-    void DDP::commonParameters(Robot_config &robot) {
-        setCommonPlannerParameters(robot, dt, minAccelerSpeed, maxAccelerSpeed,
-                                  minAngularAccelerSpeed, maxAngularAccelerSpeed);
-        local_goal = robot.getLocalGoalCfg();
-    }
+    // commonParameters 已统一到 LocalPlannerBase::commonParameters(LocalPlannerBase.cpp)。
+    // 各 planner 通过继承直接调用基类版本，原 5 份逐字一致的实现已合并为 1 份。
 
     void DDP::normalParameters(Robot_config &robot) {
         (void)robot;
@@ -128,13 +113,6 @@ namespace Antipatrea {
     }
 
 
-    void DDPDWAPlanner::commonParameters(Robot_config &robot) {
-        setCommonPlannerParameters(robot, dt, minAccelerSpeed, maxAccelerSpeed,
-                                  minAngularAccelerSpeed, maxAngularAccelerSpeed);
-
-        local_goal = robot.getLocalGoalCfg();
-
-    }
 
     void DDPDWAPlanner::normalParameters(Robot_config &robot) {
         v_steps_ = 20;
@@ -225,13 +203,6 @@ namespace Antipatrea {
         aw_cost_gain_ = 0.5;
     }
 
-    void DWAPlanner::commonParameters(Robot_config &robot) {
-        setCommonPlannerParameters(robot, dt, minAccelerSpeed, maxAccelerSpeed,
-                                  minAngularAccelerSpeed, maxAngularAccelerSpeed);
-
-        local_goal = robot.getLocalGoalCfg();
-
-    }
 
     void DWAPlanner::normalParameters(Robot_config &robot) {
         const auto tp = robot.getTuningParams();
@@ -338,13 +309,6 @@ namespace Antipatrea {
     }
 
 
-    void DDPMPPIPlanner::commonParameters(Robot_config &robot) {
-        setCommonPlannerParameters(robot, dt, minAccelerSpeed, maxAccelerSpeed,
-                                  minAngularAccelerSpeed, maxAngularAccelerSpeed);
-
-        local_goal = robot.getLocalGoalCfg();
-
-    }
 
     void DDPMPPIPlanner::normalParameters(Robot_config &robot) {
         v_steps_ = 20;
@@ -438,13 +402,6 @@ namespace Antipatrea {
         aw_cost_gain_ = 0.5;
     }
 
-    void MPPIPlanner::commonParameters(Robot_config &robot) {
-        setCommonPlannerParameters(robot, dt, minAccelerSpeed, maxAccelerSpeed,
-                                  minAngularAccelerSpeed, maxAngularAccelerSpeed);
-
-        local_goal = robot.getLocalGoalCfg();
-
-    }
 
      void MPPIPlanner::normalParameters(Robot_config &robot) {
         const auto tp = robot.getTuningParams();

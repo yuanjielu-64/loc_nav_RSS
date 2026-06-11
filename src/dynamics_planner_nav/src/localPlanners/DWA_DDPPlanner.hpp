@@ -17,6 +17,7 @@
 #define Antipatrea__DDPDWAPlanner_HPP_
 
 #include "../robot/Go2.hpp"
+#include "localPlanners/LocalPlannerBase.hpp"
 #include "utils/Algebra.hpp"
 #include <numeric>
 #include <thread>
@@ -30,59 +31,18 @@
 namespace Antipatrea {
     using PoseState = Robot_config::PoseState;
 
-    class DDPDWAPlanner {
+    // 继承公共基类：通用纯函数(normalizeAngle/updateVelocity/calculateTheta)由基类提供。
+    class DDPDWAPlanner : public LocalPlannerBase {
     public:
         DDPDWAPlanner() = default;
         virtual ~DDPDWAPlanner() = default;
 
         virtual bool Solve(int nrIters, double dt, bool &canBeSolved);
 
-        class Cost {
-        public:
-            Cost();
-
-            Cost(double obs_cost, double to_goal_cost, double speed_cost, double path_cost, double ori_cost,
-                 double aw_cost,
-                 double total_cost);
-
-            void calc_total_cost();
-
-            double obs_cost_;
-            double to_goal_cost_;
-            double speed_cost_;
-            double path_cost_;
-            double ori_cost_;
-            double aw_cost_;
-
-            double total_cost_;
-        };
-
-        class RobotBox {
-        public:
-            RobotBox();
-
-            RobotBox(double x_min_, double x_max_, double y_min_, double y_max_);
-
-            double x_min, x_max;
-            double y_min, y_max;
-        };
-
-        class Window {
-        public:
-            Window();
-
-            double min_velocity_;
-            double max_velocity_;
-            double min_angular_velocity_;
-            double max_angular_velocity_;
-        };
-
         Robot_config *robot = nullptr;
 
     protected:
         void updateRobotState();
-
-        virtual void commonParameters(Robot_config &robot);
 
         virtual void frontBackParameters(Robot_config &robot);
 
@@ -117,7 +77,6 @@ namespace Antipatrea {
         virtual std::pair<std::vector<PoseState>, std::vector<PoseState> > generateTrajectory(
             PoseState &state, PoseState &state_odom, double v, double w);
 
-        virtual double updateVelocity(double current, double target, double maxAccel, double minAccel, double t);
 
         virtual void motion(PoseState &state, double velocity, double angular_velocity, double t);
 
@@ -146,7 +105,6 @@ namespace Antipatrea {
 
         virtual double calc_ori_cost(const std::vector<PoseState> &traj);
 
-        virtual double calc_angular_velocity(const std::vector<PoseState> &traj);
 
         virtual double calc_path_cost(const std::vector<PoseState> &traj);
 
@@ -154,19 +112,16 @@ namespace Antipatrea {
 
         virtual Window calc_dynamic_window(PoseState &state, double dt);
 
-        virtual double calculateTheta(const PoseState &x, const double *y);
 
         virtual double calculateDistanceToCarEdge(
             double carX, double carY, double cosTheta, double sinTheta,
             double halfLength, double halfWidth, const std::vector<double> &obs);
 
-        virtual double normalizeAngle(double angle);
 
         bool use_goal_cost_ = false;
         bool use_speed_cost_ = false;
         bool use_path_cost_ = false;
         bool use_ori_cost_ = false;
-        bool use_angular_cost_ = false;
 
         double angle_to_goal_ = M_PI / 2;
 
@@ -182,7 +137,6 @@ namespace Antipatrea {
         PoseState parent;
         PoseState parent_odom;
 
-        std::vector<double> local_goal;
         std::vector<double> timeInterval;
         std::vector<double> weights;
 
@@ -193,12 +147,6 @@ namespace Antipatrea {
         double ori_cost_gain_ = 0.3;
         double aw_cost_gain_ = 0.2;
 
-        double minAccelerSpeed;
-        double maxAccelerSpeed;
-        double minAngularAccelerSpeed;
-        double maxAngularAccelerSpeed;
-
-        double dt;
         double n;
 
         // mtx was unused

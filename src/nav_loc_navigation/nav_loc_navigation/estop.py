@@ -44,14 +44,14 @@ SPORT_API_ID_MOVE = 1008       # Move: used to send an explicit zero velocity
 # NOTE: keep these specific. Do NOT use a broad pattern like "nav_loc_navigation"
 # because this e-stop tool itself runs as `ros2 run nav_loc_navigation estop`
 # and would kill itself before it finishes flooding StopMove.
+#
+# 本架构下狗只由 “你的 DDP 节点 -> /cmd_vel -> cmd_vel_to_sport 桥 -> 狗” 驱动。
+# 急停【只杀你自己的规划节点】即可：/cmd_vel 一停，桥的看门狗 0.5s 自动发停，
+# 加上下面连发 3 秒 StopMove 会立刻把狗停住并保持站立。
+# 桥(cmd_vel_to_sport) 与 nav2 全部保留 —— 急停后只需在 CLion 重新启动节点即可继续，
+# 无需重启桥或 nav2。
 KILL_PATTERNS = [
-    "cmd_vel_to_sport",
-    "navigation.launch.py",
-    "controller_server",
-    "bt_navigator",
-    "planner_server",
-    "behavior_server",
-    "waypoint_follower",
+    "dynamics_planner_nav_node",
 ]
 
 FLOOD_HZ = 20.0

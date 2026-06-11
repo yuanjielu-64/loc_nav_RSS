@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # start_stack.sh — bring up the PC-side Go2 helpers.
 #
-#   1. go2_front_camera        (front fisheye videohub api_id=1001 ->
+#   1. odom_tf_broadcaster    (/odometry/filtered -> TF odom->base_link, stamped
+#                              with the PC clock, generated LOCALLY)
+#   2. go2_front_camera        (front fisheye videohub api_id=1001 ->
 #                                sensor_msgs/Image)
+#
+# WHY odom_tf_broadcaster runs HERE (not on the dog) (2026-06-10): RViz/nav2 all
+# run on the PC and look up odom->base_link every frame. When the dog broadcast
+# that TF at 150 Hz over the network, RViz (software-rendered, CPU-bound) could
+# not drain the stream fast enough; its TF buffer stayed shallow and scan/Axes
+# lookups at slightly-past stamps missed ~60% of the time -> visible flutter and
+# "extrapolation" spam. Generating the TF locally from the small RELIABLE
+# /odometry/filtered relay (stamped with PC now() on receipt) keeps the buffer
+# tip always at ~now with zero network jitter, so lookups hit. The dog's launch
+# no longer broadcasts odom->base_link (only relays /odometry/filtered) to avoid
+# two publishers of the same transform.
 #
 # MOVED TO THE DOG (2026-06-09): the whole localization stack
 # (robot_state_publisher, joint_state_bridge, odom_tf_broadcaster, odom_relay,
@@ -47,15 +60,24 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-# NOTE: localization now runs on the dog (lu_localization.service). Only the
-# front fisheye is started here.
-echo "[1/1] starting go2_front_camera (front fisheye videohub api_id=1001)..."
+# NOTE: localization now runs on the dog (lu_localization.service). The PC only
+# generates the odom->base_link TF locally (see header) and starts the fisheye.
+echo "[1/2] starting local odom_tf_broadcaster (/odometry/filtered -> odom->base_link)..."
+ros2 run nav_loc_localization odom_tf_broadcaster --ros-args \
+    -p odom_topic:=/odometry/filtered \
+    -p odom_frame:=odom \
+    -p base_frame:=base_link \
+    > "$LOG_DIR/odom_tf.log" 2>&1 &
+LOC_PID=$!
+
+echo "[2/2] starting go2_front_camera (front fisheye videohub api_id=1001)..."
 ros2 launch go2_front_camera front_camera.launch.py poll_rate_hz:=10.0 \
     > "$LOG_DIR/front_camera.log" 2>&1 &
 CAM_PID=$!
 
 echo
 echo "Stack up:"
+echo "  odom_tf      pid $LOC_PID  -> $LOG_DIR/odom_tf.log"
 echo "  camera       pid $CAM_PID  -> $LOG_DIR/front_camera.log"
 echo "  (localization runs on the dog: ssh go2-jetson systemctl status lu_localization)"
 echo "Ctrl+C to stop everything."

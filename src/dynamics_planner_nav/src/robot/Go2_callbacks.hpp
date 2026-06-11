@@ -46,6 +46,9 @@ private:
     bool handleEmptyGlobalPath();
     void processValidGlobalPath(const nav_msgs::msg::Path::SharedPtr msg);
     double computeLookaheadThreshold() const;
+
+    // 到达判定：传入当前(odom)位置，若离 global goal 在阈值内则锁存 goal_reached 并停止规划。
+    void checkGoalReached(double cur_x, double cur_y);
 };
 
 #endif // DYNAMICS_PLANNER_NAV_GO2_CALLBACKS_HPP

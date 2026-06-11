@@ -10,10 +10,32 @@
 #include "Utility.hpp"
 
 bool Robot_config::setup() {
-    if (!checkGazeboPaused() && getRobotState() != INITIALIZING && getPoseState().valid_ && getMapData() && local_goal_received) {
-        return true;
+    // --- Per-condition diagnostics ---------------------------------------
+    // Evaluate each precondition separately so we can see *which* one blocks
+    // setup() each cycle. getMapData() mutates state (fills `map`, may set
+    // NO_MAP_PLANNING), so we only call it when the earlier conditions hold,
+    // preserving the original short-circuit semantics.
+    const bool gazebo_ok = !checkGazeboPaused();
+    const bool state_ok  = getRobotState() != INITIALIZING;
+    const bool pose_ok   = getPoseState().valid_;
+
+    bool map_ok = false;
+    if (gazebo_ok && state_ok && pose_ok) {
+        map_ok = getMapData();
     }
-    return false;
+    const bool goal_ok = local_goal_received;
+
+    const bool ready = gazebo_ok && state_ok && pose_ok && map_ok && goal_ok;
+
+    RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "[setup] ready=%d | gazebo_ok=%d state_ok=%d(state=%d) pose_ok=%d "
+        "map_ok=%d(map_src=%d laser=%zu costmap=%zu) goal_ok=%d",
+        ready, gazebo_ok, state_ok, static_cast<int>(getRobotState()),
+        pose_ok, map_ok, static_cast<int>(currentMap),
+        laserData.size(), costmapData.size(), goal_ok);
+
+    return ready;
 }
 
 bool Robot_config::checkGazeboPaused() const {
@@ -58,6 +80,13 @@ bool Robot_config::getMapData() {
         return true;
     }
 
+    // 拿到地图数据后，如果之前因无数据落入 NO_MAP_PLANNING，恢复正常规划。
+    // 否则状态机会永久卡在 NO_MAP_PLANNING（启动时 laser 未到 → 进 NO_MAP，
+    // 数据到了也回不来），导致 DDP 一直走 handleNoMapPlanning、不避障。
+    if (getRobotState() == NO_MAP_PLANNING) {
+        setRobotState(NORMAL_PLANNING);
+    }
+
     return !map.empty();
 }
 
@@ -73,6 +102,20 @@ Robot_config::Footprint Robot_config::getFootprint() const {
     }
 
     return {ROBOT_LENGTH, ROBOT_WIDTH};
+}
+
+go2::Footprint Robot_config::getRobotVolume() const {
+    // 优先：预测模型从 /predicted_footprint 发来的体积
+    if (footprint_receiver_ && footprint_receiver_->hasReceived()) {
+        return footprint_receiver_->getLatest();
+    }
+
+    // 回退：与 getFootprint() 一致的预设
+    const RobotState state = getRobotState();
+    if (state == BACKWARD || currentMap != ONLY_LASER_RECEIVED) {
+        return go2::Footprint::simpleBox(POINT_MASS_LENGTH, POINT_MASS_WIDTH);
+    }
+    return go2::Footprint::simpleBox(ROBOT_LENGTH, ROBOT_WIDTH);
 }
 
 Robot_config::VelocityLimits Robot_config::getVelocityLimits() const {
@@ -136,13 +179,22 @@ Robot_config::Robot_config()
     // ---- Create Async Task Executor ----
     async_executor_ = std::make_shared<AsyncTaskExecutor>(num_threads);
 
+    // ---- Create predicted-footprint receiver ----
+    // 订阅 /predicted_footprint；未来预测模型发 Float64MultiArray 即生效，
+    // 没有发布者也不影响（getRobotVolume() 会回退到预设矩形）。
+    footprint_receiver_ = std::make_unique<go2::FootprintReceiver>(this);
+
     // ---- ROS2 Subscriptions ----
+    // Unitree /utlidar/robot_odom and the lidar /front/scan are published with
+    // sensor-data (BEST_EFFORT) QoS. Use SensorDataQoS so we stay compatible
+    // with both BEST_EFFORT and RELIABLE publishers (avoids the
+    // "incompatible QoS / No messages will be sent" warning).
     robot_pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/utlidar/robot_odom", 10,
+        "/utlidar/robot_odom", rclcpp::SensorDataQoS(),
         std::bind(&Go2Callbacks::odometryCallback, callbacks_.get(), std::placeholders::_1));
 
     laser_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        "/front/scan", 10,
+        "/front/scan", rclcpp::SensorDataQoS(),
         std::bind(&Go2Callbacks::laserScanCallback, callbacks_.get(), std::placeholders::_1));
 
     goal_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -154,7 +206,7 @@ Robot_config::Robot_config()
         std::bind(&Go2Callbacks::costmapCallback, callbacks_.get(), std::placeholders::_1));
 
     velocity_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/utlidar/robot_odom", 10,
+        "/utlidar/robot_odom", rclcpp::SensorDataQoS(),
         std::bind(&Go2Callbacks::velocityCallback, callbacks_.get(), std::placeholders::_1));
 
     global_path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
@@ -172,11 +224,8 @@ Robot_config::Robot_config()
     // ---- ROS2 Publishers ----
     trajectory_pub_ = this->create_publisher<nav_msgs::msg::Path>("trajectory", 10);
     global_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("global_path", 10);
-    smoothed_global_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("smoothed_global_path", 10);
     local_goal_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("local_goal", 1);
     global_goal_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("global_goal", 1);
-    tuning_params_pub_ = this->create_publisher<std_msgs::msg::String>("/tuning_params", 1);
-    obstacles_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/teb_obstacles", 1);
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
     robot_state_pub_ = this->create_publisher<std_msgs::msg::String>("/robot_mode", 1);
 
@@ -240,38 +289,6 @@ void Robot_config::setTuningParams(const TuningParams &tp) {
     tuning_params_ = tp;
 }
 
-void Robot_config::update_angular_velocity() {
-    if (getAlgorithm() == DWA || getAlgorithm() == DWA_DDP) {
-        if (getRobotState() == NORMAL_PLANNING)
-            max_vel_theta = 2;
-        else if (getRobotState() == LOW_SPEED_PLANNING)
-            max_vel_theta = 1;
-    } else {
-        if (getRobotState() == NORMAL_PLANNING) {
-            if (std::abs(getPoseState().angular_velocity_) <= 1 &&
-                std::abs(getPoseState().velocity_) <= 1 * max_vel_x / 3)
-                max_vel_theta = 2;
-            else if ((std::abs(getPoseState().angular_velocity_) <= 2 &&
-                      std::abs(getPoseState().angular_velocity_) > 1 * max_vel_x / 3) ||
-                     (std::abs(getPoseState().velocity_) > 1 &&
-                      std::abs(getPoseState().velocity_) <= 2 * max_vel_x / 3))
-                max_vel_theta = 1.5;
-            else
-                max_vel_theta = 1.0;
-        } else if (getRobotState() == LOW_SPEED_PLANNING) {
-            if (std::abs(getPoseState().angular_velocity_) <= 1 &&
-                std::abs(getPoseState().velocity_) <= 1 * max_vel_x / 3)
-                max_vel_theta = 2.5;
-            else if ((std::abs(getPoseState().angular_velocity_) <= 2 &&
-                      std::abs(getPoseState().angular_velocity_) > 1 * max_vel_x / 3) ||
-                     (std::abs(getPoseState().velocity_) > 0.2 &&
-                      std::abs(getPoseState().velocity_) <= 2 * max_vel_x / 3))
-                max_vel_theta = 2;
-            else
-                max_vel_theta = 1.5;
-        }
-    }
-}
 
 void Robot_config::setRobotState(RobotState state) {
     currentState = state;
@@ -412,6 +429,3 @@ void Robot_config::view_Goal(std::vector<double> &goal, std::vector<double> &goa
     }
 }
 
-void Robot_config::viewObstacles() const {
-    // TODO: Implement obstacle visualization using PointCloud2
-}

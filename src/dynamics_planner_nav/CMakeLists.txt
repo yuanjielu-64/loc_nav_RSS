@@ -124,7 +124,6 @@ install(TARGETS
 # Install launch files
 install(DIRECTORY
   launch
-  params
   config
   rviz
   DESTINATION share/${PROJECT_NAME}
