@@ -58,7 +58,7 @@ namespace Antipatrea {
 
         virtual bool handleLowSpeedPlanning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
-        virtual bool handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
+        virtual bool handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
         virtual void publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular);
 
@@ -115,7 +115,6 @@ namespace Antipatrea {
 
         virtual double calc_dist_to_path(const std::vector<double> &state);
 
-        virtual Window calc_dynamic_window(PoseState &state, double dt);
 
 
         bool use_goal_cost_ = false;
@@ -126,7 +125,8 @@ namespace Antipatrea {
         double angle_to_goal_ = M_PI / 2;
 
         double robot_radius_ = 0.03;
-        double distance = 0.0;
+        // 候选轨迹被接受所需的最小行进距离(总弧长下限)；轨迹太短则判无效。原名 distance。
+        double min_traj_length_ = 0.0;
 
         int num_threads;  // Set from robot->num_threads
         double obs_range_ = 4;

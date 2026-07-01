@@ -1,7 +1,8 @@
 // Go2_footprint.cpp — 机器人物理体积(几何)模型【实现】
 //
-// 几何方程(SDF)、Shape/Footprint 的方法、以及从 ROS topic 接收"预测体积"的
-// FootprintReceiver 都实现在这里。声明见 Go2_footprint.hpp。
+// 几何方程(SDF)、Shape/Footprint 的方法都实现在这里。声明见 Go2_footprint.hpp。
+// 体积档的存储现在直接放在 Robot_config 上(models_static_ / models_dynamic_)，
+// ROS 订阅解析则在 Go2_callbacks::robotVolumeCallback 里就地完成。
 
 #include "Go2_footprint.hpp"
 
@@ -48,6 +49,27 @@ double capsuleSDF(const Point2& p, const Point2& a, const Point2& b, double r) {
     return segmentDistance(p, a, b) - r;
 }
 
+double polygonSDF(const Point2& p, const std::vector<Point2>& verts) {
+    const size_t n = verts.size();
+    if (n == 0) return std::numeric_limits<double>::max();
+    if (n == 1) return std::hypot(p.x - verts[0].x, p.y - verts[0].y);
+    if (n == 2) return segmentDistance(p, verts[0], verts[1]);
+
+    // 到最近边的距离 + 凸多边形内外判定(叉积同号，与绕向无关)。
+    double dmin = std::numeric_limits<double>::max();
+    bool allPos = true, allNeg = true;
+    for (size_t i = 0; i < n; ++i) {
+        const Point2& a = verts[i];
+        const Point2& b = verts[(i + 1) % n];
+        dmin = std::min(dmin, segmentDistance(p, a, b));
+        const double cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if (cross < 0.0) allPos = false;
+        if (cross > 0.0) allNeg = false;
+    }
+    const bool inside = allPos || allNeg;
+    return inside ? -dmin : dmin;
+}
+
 //==============================================================================
 // Shape
 //==============================================================================
@@ -59,6 +81,7 @@ double Shape::signedDistance(const Point2& p) const {
         case CAPSULE: return capsuleSDF(p, center, tip, radius);
         case CUSTOM:  return custom_sdf ? custom_sdf(p)
                                         : std::numeric_limits<double>::max();
+        case POLYGON: return polygonSDF(p, verts);
     }
     return std::numeric_limits<double>::max();
 }
@@ -70,6 +93,11 @@ double Shape::maxExtent() const {
         case CAPSULE: return std::max(std::hypot(center.x, center.y),
                                       std::hypot(tip.x, tip.y)) + radius;
         case CUSTOM:  return custom_extent;
+        case POLYGON: {
+            double r = 0.0;
+            for (const auto& v : verts) r = std::max(r, std::hypot(v.x, v.y));
+            return r;
+        }
     }
     return 0.0;
 }
@@ -119,6 +147,14 @@ Footprint& Footprint::addCustom(std::function<double(const Point2&)> sdf, double
     return *this;
 }
 
+Footprint& Footprint::addPolygon(const std::vector<Point2>& verts) {
+    Shape s;
+    s.type = Shape::POLYGON;
+    s.verts = verts;
+    shapes_.push_back(std::move(s));
+    return *this;
+}
+
 void Footprint::clear() { shapes_.clear(); }
 
 bool Footprint::empty() const { return shapes_.empty(); }
@@ -143,6 +179,35 @@ double Footprint::distanceToPoint(double rx, double ry, double rtheta,
     return d;
 }
 
+double Footprint::distanceToSegment(double rxA, double ryA, double rthetaA,
+                                    double rxB, double ryB, double rthetaB,
+                                    double world_x, double world_y,
+                                    double d_max, double a_max) const {
+    const double dx = rxB - rxA;
+    const double dy = ryB - ryA;
+    const double trans = std::hypot(dx, dy);
+
+    // 转角差归一化到[-pi,pi]，走最短弧插值(避免 359°->1° 当成转一大圈)。
+    double dth = rthetaB - rthetaA;
+    while (dth >  M_PI) dth -= 2.0 * M_PI;
+    while (dth < -M_PI) dth += 2.0 * M_PI;
+
+    // 自适应子步：平移和转角各自所需细分取较大者；近场才会被调用，K 通常 1~3。
+    const int k_trans = (d_max > 0.0) ? static_cast<int>(std::ceil(trans / d_max)) : 1;
+    const int k_rot   = (a_max > 0.0) ? static_cast<int>(std::ceil(std::fabs(dth) / a_max)) : 1;
+    const int K = std::max({1, k_trans, k_rot});
+
+    double best = std::numeric_limits<double>::max();
+    for (int k = 0; k <= K; ++k) {
+        const double s  = static_cast<double>(k) / K;
+        const double rx = rxA + s * dx;
+        const double ry = ryA + s * dy;
+        const double rt = rthetaA + s * dth;
+        best = std::min(best, distanceToPoint(rx, ry, rt, world_x, world_y));
+    }
+    return best;
+}
+
 bool Footprint::isColliding(double rx, double ry, double rtheta,
                             double world_x, double world_y, double margin) const {
     return distanceToPoint(rx, ry, rtheta, world_x, world_y) <= margin;
@@ -152,6 +217,44 @@ double Footprint::circumscribedRadius() const {
     double r = 0.0;
     for (const auto& shape : shapes_) r = std::max(r, shape.maxExtent());
     return r;
+}
+
+double Footprint::edgeRadiusAtAngle(double angle) const {
+    if (shapes_.empty()) return 0.0;
+
+    const double dx = std::cos(angle);
+    const double dy = std::sin(angle);
+    // 体坐标系下点 (t*dir) 到机器人体积的有符号距离：内部<0, 外部>0。
+    auto sdAt = [&](double t) {
+        const Point2 p{t * dx, t * dy};
+        double d = std::numeric_limits<double>::max();
+        for (const auto& s : shapes_) d = std::min(d, s.signedDistance(p));
+        return d;
+    };
+
+    // 原点必须在体积内部(star-shaped 前提)，否则该方向无良定义边缘半径。
+    if (sdAt(0.0) > 0.0) return 0.0;
+
+    double hi = circumscribedRadius() + 1e-3;  // 上界：外接圆外一点，必在体外
+    if (sdAt(hi) < 0.0) return hi;             // 兜底(理论不会发生)
+
+    // 二分找零点(最外层边界)：lo 始终在内部, hi 始终在外部。
+    double lo = 0.0;
+    for (int i = 0; i < 40; ++i) {
+        const double mid = 0.5 * (lo + hi);
+        if (sdAt(mid) < 0.0) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+std::vector<double> Footprint::radialProfile(int n) const {
+    std::vector<double> prof;
+    if (n <= 0) return prof;
+    prof.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        prof.push_back(edgeRadiusAtAngle(2.0 * M_PI * i / n));
+    }
+    return prof;
 }
 
 //==============================================================================
@@ -220,32 +323,61 @@ Footprint Footprint::fromFloatArray(const std_msgs::msg::Float64MultiArray& msg)
     return f;
 }
 
+std::vector<Footprint> Footprint::parseFootprints(const std_msgs::msg::Float64MultiArray& msg) {
+    // 编码: data[0]=档数; 每档 [kind,count,payload]:
+    //   kind=1 圆     -> payload = cx,cy,r              (count 恒为 1)
+    //   kind=0 多边形 -> payload = count 个 (x,y)        (base_link 系，已含 margin)
+    std::vector<Footprint> out;
+    const auto& d = msg.data;
+    if (d.empty()) return out;
+
+    const int num_models = static_cast<int>(d[0]);
+    size_t i = 1;
+    for (int m = 0; m < num_models && i + 1 < d.size(); ++m) {
+        const int kind = static_cast<int>(d[i]);
+        const int count = static_cast<int>(d[i + 1]);
+        i += 2;
+        Footprint f;
+        if (kind == 1) {
+            // 圆: cx, cy, r
+            if (i + 3 > d.size()) break;
+            f.addCircle(d[i + 2], d[i + 0], d[i + 1]);
+            i += 3;
+        } else {
+            // 多边形: count 个 (x,y)
+            if (i + static_cast<size_t>(2 * count) > d.size()) break;
+            std::vector<Point2> verts;
+            verts.reserve(count);
+            for (int k = 0; k < count; ++k) {
+                verts.push_back(Point2{d[i + 2 * k], d[i + 2 * k + 1]});
+            }
+            f.addPolygon(verts);
+            i += static_cast<size_t>(2 * count);
+        }
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+
 //==============================================================================
-// FootprintReceiver — ROS 订阅器
+// buildStaticVolumes：按机身尺寸构建静态体积档位(几何实现集中在此，便于扩展)。
+// 返回顺序固定，索引与 Robot_config::VolumeModel 对齐：[0]质点 [1]外接圆 [2]矩形。
 //==============================================================================
+std::vector<Footprint> buildStaticVolumes(double length, double width, double point_mass) {
+    const double hl = length / 2.0;
+    const double hw = width / 2.0;
 
-FootprintReceiver::FootprintReceiver(rclcpp::Node* node, const std::string& topic) {
-    sub_ = node->create_subscription<std_msgs::msg::Float64MultiArray>(
-        topic, 1,
-        std::bind(&FootprintReceiver::callback, this, std::placeholders::_1));
-}
+    std::vector<Footprint> models(3);
 
-void FootprintReceiver::callback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-    Footprint parsed = Footprint::fromFloatArray(*msg);
-    if (parsed.empty()) return;  // 空/无效预测：保留上一帧，不覆盖
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_ = std::move(parsed);
-    received_ = true;
-}
+    // [0] 质点
+    models[0] = Footprint::pointMass(point_mass);
+    // [1] 粗糙：单个外接圆(最保守)，半径 = 机身半对角线
+    models[1].addCircle(std::hypot(hl, hw));
+    // [2] 正常：矩形
+    models[2] = Footprint::simpleBox(length, width);
 
-bool FootprintReceiver::hasReceived() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return received_;
-}
-
-Footprint FootprintReceiver::getLatest() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return latest_;
+    return models;
 }
 
 }  // namespace go2

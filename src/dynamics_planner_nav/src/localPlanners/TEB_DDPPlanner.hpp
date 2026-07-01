@@ -48,7 +48,7 @@ namespace Antipatrea {
         bool handleNoMapPlanning(geometry_msgs::msg::Twist &cmd_vel);
         bool handleNormalSpeedPlanning(geometry_msgs::msg::Twist &cmd_vel, double dt);
         bool handleLowSpeedPlanning(geometry_msgs::msg::Twist &cmd_vel, double dt);
-        bool handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel, double dt);
+        bool handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel, double dt);
 
         void publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular);
 

@@ -42,6 +42,13 @@ namespace Antipatrea {
 
         Robot_config *robot = nullptr;
 
+        // 全向控制量(Go2)：vx 机体前向、vy 机体侧向、w 偏航角速度。取代旧的 (v,w) pair。
+        struct Control {
+            double vx{0.0};
+            double vy{0.0};
+            double w{0.0};
+        };
+
     protected:
         void updateRobotState();
 
@@ -60,9 +67,11 @@ namespace Antipatrea {
 
         virtual bool handleLowSpeedPlanning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
-        virtual bool handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
+        virtual bool handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel, std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
         virtual void publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular);
+        // 全向下发：带侧向速度 vy(cmd_vel.linear.y)。
+        virtual void publishCommand(geometry_msgs::msg::Twist &cmd_vel, double vx, double vy, double angular);
 
         virtual double recover(PoseState &state, PoseState &state_odom,
                               std::pair<std::vector<PoseState>, bool> &best_traj, bool &results);
@@ -78,16 +87,16 @@ namespace Antipatrea {
             PoseState &state, PoseState &state_odom, double angular_velocity);
 
         virtual std::pair<std::vector<PoseState>, std::vector<PoseState> > generateTrajectory(
-            PoseState &state, PoseState &state_odom, std::vector<std::pair<double, double>> &perturbations);
+            PoseState &state, PoseState &state_odom, std::vector<Control> &perturbations);
 
         virtual std::pair<std::vector<PoseState>, std::vector<PoseState> > generateTrajectory(
-            PoseState &state, PoseState &state_odom, double v, double w);
+            PoseState &state, PoseState &state_odom, double vx, double vy, double w);
 
 
-        virtual void motion(PoseState &state, double velocity, double angular_velocity, double t);
+        virtual void motion(PoseState &state, double vx, double vy, double angular_velocity, double t);
 
         virtual void process_segment(int thread_id, int start, int end, PoseState &state, PoseState &state_odom, Window &dw,
-                                     std::vector<std::pair<double, double>> &pairs, std::vector<Cost> &thread_costs,
+                                     std::vector<Control> &pairs, std::vector<Cost> &thread_costs,
                                      std::vector<std::pair<std::vector<PoseState>, std::vector<PoseState> > > &
                                      thread_trajectories);
 
@@ -114,7 +123,6 @@ namespace Antipatrea {
 
         virtual double calc_dist_to_path(const std::vector<double> &state);
 
-        virtual Window calc_dynamic_window(PoseState &state, double dt);
 
 
         bool use_goal_cost_ = false;
@@ -125,7 +133,8 @@ namespace Antipatrea {
         double angle_to_goal_ = M_PI / 2;
 
         double robot_radius_ = 0.03;
-        double distance = 0.0;
+        // 候选轨迹被接受所需的最小行进距离(总弧长下限)；轨迹太短则判无效。原名 distance。
+        double min_traj_length_ = 0.0;
 
         int num_threads;  // Set from robot->num_threads
         double obs_range_ = 4;
@@ -134,6 +143,7 @@ namespace Antipatrea {
         int nr_steps_ = 20;
         double linear_stddev = 0.1;
         double angular_stddev = 0.05;
+        double lateral_stddev = 0.05;   // 全向侧移采样标准差(vy)
 
         int v_steps_ = 20;
         int w_steps_ = 20;

@@ -21,3 +21,13 @@ Other style rules:
   change or the reasoning.
 - Keep answers short and to the point.
 
+## Coding rule (from user, verbatim)
+
+> 代码命名的时候要简单易懂。
+
+How I apply it:
+- 变量/函数/类的命名必须直观、见名知意，一眼看懂用途，不用翻实现。
+- 用完整、常见的英文单词，避免生僻缩写、拼音、单字母（循环计数器 `i/j` 等惯例除外）。
+  - 例：`front_clearance` 而非 `fc`；`recover_attempt_count` 而非 `rt`；`most_open_direction` 而非 `mod`。
+- 名字描述「是什么 / 干什么」，不描述「怎么实现」；宁可长一点也要清楚。
+

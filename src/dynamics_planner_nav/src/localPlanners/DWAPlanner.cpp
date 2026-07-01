@@ -6,7 +6,7 @@
 
 namespace Antipatrea {
     void DWAPlanner::updateRobotState() {
-        parent = {0, 0, 0, robot->getPoseState().velocity_, robot->getPoseState().angular_velocity_, true};
+        parent = {0, 0, 0, robot->getPoseState().vx_, robot->getPoseState().angular_velocity_, true};
         parent_odom = robot->getPoseState();
     }
 
@@ -25,17 +25,17 @@ namespace Antipatrea {
         commonParameters(*robot);
 
         switch (robot->getRobotState()) {
-            case Robot_config::NO_MAP_PLANNING:
+            case Robot_config::BLIND:
                 return handleNoMapPlanning(cmd_vel);
 
-            case Robot_config::NORMAL_PLANNING:
+            case Robot_config::NORMAL:
                 return handleNormalSpeedPlanning(cmd_vel, best_traj, dt);
 
-            case Robot_config::LOW_SPEED_PLANNING:
+            case Robot_config::CAUTIOUS:
                 return handleLowSpeedPlanning(cmd_vel, best_traj, dt);
 
             default:
-                return handleAbnormalPlaning(cmd_vel, best_traj, dt);
+                return handleAbnormalPlanning(cmd_vel, best_traj, dt);
         }
     }
 
@@ -61,12 +61,12 @@ namespace Antipatrea {
 
         auto result = dwa_planning(parent, parent_odom, best_traj, dt);
 
-        robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
+        robot->viewTrajectories(best_traj.first, nr_steps_);
 
         if (result == false) {
             publishCommand(cmd_vel, -0.2 , 0);
         } else {
-            publishCommand(cmd_vel, best_traj.first[1].velocity_ , best_traj.first[1].angular_velocity_);
+            publishCommand(cmd_vel, best_traj.first[1].vx_ , best_traj.first[1].angular_velocity_);
         }
 
         return true;
@@ -79,39 +79,39 @@ namespace Antipatrea {
 
         auto result = dwa_planning(parent, parent_odom, best_traj, dt);
 
-        robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
+        robot->viewTrajectories(best_traj.first, nr_steps_);
 
         if (!result) {
-            robot->setRobotState(Robot_config::BRAKE_PLANNING);
+            robot->setRobotState(Robot_config::BRAKE);
             publishCommand(cmd_vel, 0, 0);
         } else
-            publishCommand(cmd_vel, best_traj.first.front().velocity_, best_traj.first.front().angular_velocity_);
+            publishCommand(cmd_vel, best_traj.first.front().vx_, best_traj.first.front().angular_velocity_);
 
         return true;
     }
 
-    bool DWAPlanner::handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel,
+    bool DWAPlanner::handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel,
                                            std::pair<std::vector<PoseState>, bool> &best_traj, double dt) {
         (void)dt;
 
-        if (robot->getRobotState() == Robot_config::BRAKE_PLANNING) {
-            double vel = robot->getPoseState().velocity_;
+        if (robot->getRobotState() == Robot_config::BRAKE) {
+            double vel = robot->getPoseState().vx_;
             if (vel > 0.01)
                 publishCommand(cmd_vel, -0.1, 0.0);
             else {
                 publishCommand(cmd_vel, 0.0, 0.0);
-                robot->setRobotState(Robot_config::RECOVERY);
+                robot->setRobotState(Robot_config::RECOVER);
             }
 
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::ROTATE_PLANNING) {
+        if (robot->getRobotState() == Robot_config::ROTATE) {
 
             double angle = normalizeAngle(robot->rotating_angle - robot->getPoseState().theta_);
 
             if (fabs(angle) <= 0.10) {
-                robot->setRobotState(Robot_config::NORMAL_PLANNING);
+                robot->setRobotState(Robot_config::NORMAL);
                 return true;
             }
 
@@ -121,11 +121,13 @@ namespace Antipatrea {
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::RECOVERY) {
+        if (robot->getRobotState() == Robot_config::RECOVER) {
             bool results;
 
-            if (robot->front_obs <= 0.10) {
-                robot->setRobotState(Robot_config::BACKWARD);
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            if (dir_clearance[Robot_config::DIR_FRONT] <= 0.10) {
+                robot->setRobotState(Robot_config::BACK);
                 return true;
             }
 
@@ -138,16 +140,18 @@ namespace Antipatrea {
 
             robot->rotating_angle = normalizeAngle(robot->getPoseState().theta_ + best_theta);
 
-            robot->viewTrajectories(best_traj.first, nr_steps_, best_theta, timeInterval);
-            robot->setRobotState(Robot_config::ROTATE_PLANNING);
+            robot->viewTrajectories(best_traj.first, nr_steps_);
+            robot->setRobotState(Robot_config::ROTATE);
         }
 
-        if (robot->getRobotState() == Robot_config::BACKWARD) {
+        if (robot->getRobotState() == Robot_config::BACK) {
 
             frontBackParameters(*robot);
 
-            if (robot->front_obs >= 0.10) {
-                robot->setRobotState(Robot_config::RECOVERY);
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            if (dir_clearance[Robot_config::DIR_FRONT] >= 0.10) {
+                robot->setRobotState(Robot_config::RECOVER);
                 return true;
             }
 
@@ -195,7 +199,7 @@ namespace Antipatrea {
             if (result == false)
                 continue;
 
-            robot->viewTrajectories(traj.first, nr_steps_, state_.theta_, timeInterval);
+            robot->viewTrajectories(traj.first, nr_steps_);
 
             const Cost cost = evaluate_trajectory(traj.first, _, tmp_);
             costs.push_back(cost);
@@ -210,9 +214,8 @@ namespace Antipatrea {
         Cost min_cost(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e6);
 
         if (available_traj_count == 0) {
-            // ROS2: Throttled error logging requires node context
-// Consider: RCLCPP_ERROR_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000, "When a collision occurs...")
-std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path during rotation" << std::endl;
+            RCLCPP_ERROR_STREAM_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                "When a collision occurs, the robot cannot find any path during rotation");
             best_traj.first = generateTrajectory(state, state_odom, 0.0, 0.0).first;
             results = false;
             return best_theta;
@@ -311,15 +314,13 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
                 ++traj_it;
             }
         }
-        //Logger::m_out << "multi_thread_2 " << Timer::Elapsed(d_t) << std::endl;
-
         if (costs.empty()) {
-            std::cerr << "[ERROR] No available trajectory after cleaning." << std::endl;
+            RCLCPP_ERROR_STREAM_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                "No available trajectory after cleaning.");
             best_traj.second = false;
             return false;
         }
 
-        //Logger::m_out << "available trajectory " << available_traj_count << std::endl;
         normalize_costs(costs);
 
         for (size_t i = 0; i < costs.size(); ++i) {
@@ -331,7 +332,7 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
 
         best_traj.second = true;
 
-        //Logger::m_out << "best_traj velocity  " << best_traj.first.front().velocity_ << " best_traj anglar velocity "  << best_traj.first.front().angular_velocity_ << std::endl;
+        //Logger::m_out << "best_traj velocity  " << best_traj.first.front().vx_ << " best_traj anglar velocity "  << best_traj.first.front().angular_velocity_ << std::endl;
 
         //Logger::m_out << "multi_thread_3 " << Timer::Elapsed(d_t) << std::endl;
         return true;
@@ -527,7 +528,7 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
         if (use_goal_cost_ == false)
             return 0.0;
 
-        return Algebra::PointDistance(2, &traj[traj.size() - 1].pose()[0], &local_goal[0]);
+        return Algebra::PointDistance(2, &traj[traj.size() - 1].pose()[0], &local_goal_odom[0]);
     }
 
     double DWAPlanner::calc_speed_cost(const std::vector<PoseState> &traj) {
@@ -535,14 +536,14 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
             return 0.0;
 
         const Window dw = calc_dynamic_window(parent);
-        return dw.max_velocity_ - traj.front().velocity_;
+        return dw.max_velocity_ - traj.front().vx_;
     }
 
     double DWAPlanner::calc_ori_cost(const std::vector<PoseState> &traj) {
         if (!use_ori_cost_)
             return 0.0;
 
-        double theta = calculateTheta(traj[traj.size() - 1], &local_goal[0]);
+        double theta = calculateTheta(traj[traj.size() - 1], &local_goal_odom[0]);
         return fabs(theta);
     }
 
@@ -554,10 +555,10 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
         for (int i = 0; i < (int)traj.size() - 2; i++)
             d += Algebra::PointDistance(2, &traj[i].pose()[0], &traj[i + 1].pose()[0]);
 
-        if (d <= distance)
+        if (d <= min_traj_length_)
             return 1e6;
 
-        std::vector<std::vector<double>> global_path = robot->global_paths;
+        std::vector<std::vector<double>> global_path = robot->global_paths_odom;
         if (global_path.empty()) {
             return 0;
         }
@@ -568,9 +569,9 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
                 if (point.size() < 2) continue;
                 double dx = state.x_ - point[0];
                 double dy = state.y_ - point[1];
-                double distance = std::sqrt(dx * dx + dy * dy);
-                if (distance < min_distance) {
-                    min_distance = distance;
+                double pt_dist = std::sqrt(dx * dx + dy * dy);
+                if (pt_dist < min_distance) {
+                    min_distance = pt_dist;
                 }
             }
             d += min_distance;
@@ -585,7 +586,7 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
         state.theta_ += angular_velocity * t;
         state.x_ += velocity * cos(state.theta_) * t;
         state.y_ += velocity * sin(state.theta_) * t;
-        state.velocity_ = velocity;
+        state.vx_ = velocity;
         state.angular_velocity_ = angular_velocity;
 
         state.theta_ = normalizeAngle(state.theta_);
@@ -604,15 +605,15 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
     }
 
     double DWAPlanner::calc_obs_cost(const std::vector<PoseState> &traj) {
-        auto obss = robot->getDataMap();
+        const auto &obss = robot->getDataMap();
         auto distances = robot->laserDataDistance;
         bool flag = (distances.size() == obss.size());
         auto footprint = robot->getFootprint();
         auto velocity = robot->getVelocityLimits();
         double v = velocity.max_linear;
 
-        double halfLength = footprint.length / 2.0;
-        double halfWidth = footprint.width / 2.0;
+        double halfLength = footprint[0] / 2.0;
+        double halfWidth = footprint[1] / 2.0;
 
         double min_dist = obs_range_;
 
@@ -667,8 +668,8 @@ std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path du
         double dt = robot->dt;
         auto velocity = robot->getVelocityLimits();
 
-        window.min_velocity_ = std::max((parent.velocity_ + minAccelerSpeed * dt), velocity.min_linear);
-        window.max_velocity_ = std::min((parent.velocity_ + maxAccelerSpeed * dt), velocity.max_linear);
+        window.min_velocity_ = std::max((parent.vx_ + minAccelerSpeed * dt), velocity.min_linear);
+        window.max_velocity_ = std::min((parent.vx_ + maxAccelerSpeed * dt), velocity.max_linear);
 
         window.min_angular_velocity_ = std::max(
             (parent.angular_velocity_ + minAngularAccelerSpeed * dt), velocity.min_angular);

@@ -82,9 +82,9 @@ namespace Antipatrea {
 
     void TEB_DDPPlanner::updateRobotState() {
         // Thread-safe read: get snapshot of current state
-        auto current_state = robot->getPoseStateSafe();
+        auto current_state = robot->getPoseState();
 
-        parent = {0, 0, 0, current_state.velocity_, current_state.angular_velocity_, true};
+        parent = {0, 0, 0, current_state.vx_, current_state.angular_velocity_, true};
         parent_odom = current_state;
     }
 
@@ -97,17 +97,17 @@ namespace Antipatrea {
         commonParameters(*robot);
 
         switch (robot->getRobotState()) {
-            case Robot_config::NO_MAP_PLANNING:
+            case Robot_config::BLIND:
                 return handleNoMapPlanning(cmd_vel);
 
-            case Robot_config::NORMAL_PLANNING:
+            case Robot_config::NORMAL:
                 return handleNormalSpeedPlanning(cmd_vel, dt);
 
-            case Robot_config::LOW_SPEED_PLANNING:
+            case Robot_config::CAUTIOUS:
                 return handleLowSpeedPlanning(cmd_vel, dt);
 
             default:
-                return handleAbnormalPlaning(cmd_vel, dt);
+                return handleAbnormalPlanning(cmd_vel, dt);
         }
     }
 
@@ -153,14 +153,15 @@ namespace Antipatrea {
 
         if (!success) {
             teb_failure_count_++;
-            std::cerr << "[WARN] " << "TEB planning failed (count: %d), trying DDP fallback", teb_failure_count_);
+            RCLCPP_WARN_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                "TEB planning failed (count: %d), trying DDP fallback", teb_failure_count_);
 
             // Use DDP as fallback
             success = callDDPPlanner(cmd_vel, dt);
 
             if (!success) {
                 // Both failed - stop
-                std::cerr << "[WARN] " << "Both TEB and DDP failed, stopping");
+                RCLCPP_WARN_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000, "Both TEB and DDP failed, stopping");
                 publishCommand(cmd_vel, 0, 0);
             } else {
                 use_ddp_fallback_ = true;
@@ -168,7 +169,8 @@ namespace Antipatrea {
         } else {
             // TEB succeeded - reset failure count
             if (teb_failure_count_ > 0) {
-                std::cout << "[INFO] " << "TEB recovered after %d failures", teb_failure_count_);
+                RCLCPP_INFO_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                    "TEB recovered after %d failures", teb_failure_count_);
             }
             teb_failure_count_ = 0;
             use_ddp_fallback_ = false;
@@ -201,24 +203,24 @@ namespace Antipatrea {
         return true;
     }
 
-    bool TEB_DDPPlanner::handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel, double dt) {
-        if (robot->getRobotState() == Robot_config::BRAKE_PLANNING) {
-            auto current_state = robot->getPoseStateSafe();
-            if (current_state.velocity_ > 0.01) {
+    bool TEB_DDPPlanner::handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel, double dt) {
+        if (robot->getRobotState() == Robot_config::BRAKE) {
+            auto current_state = robot->getPoseState();
+            if (current_state.vx_ > 0.01) {
                 publishCommand(cmd_vel, -0.1, 0.0);
             } else {
                 publishCommand(cmd_vel, 0.0, 0.0);
-                robot->setRobotState(Robot_config::RECOVERY);
+                robot->setRobotState(Robot_config::RECOVER);
             }
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::ROTATE_PLANNING) {
-            auto current_state = robot->getPoseStateSafe();
+        if (robot->getRobotState() == Robot_config::ROTATE) {
+            auto current_state = robot->getPoseState();
             double angle = normalizeAngle(robot->rotating_angle - current_state.theta_);
 
             if (fabs(angle) <= 0.10) {
-                robot->setRobotState(Robot_config::NORMAL_PLANNING);
+                robot->setRobotState(Robot_config::NORMAL);
                 return true;
             }
 
@@ -228,27 +230,27 @@ namespace Antipatrea {
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::RECOVERY) {
+        if (robot->getRobotState() == Robot_config::RECOVER) {
             double front_obs_snapshot, latter_obs_snapshot;
             robot->getObstacleDistanceSafe(front_obs_snapshot, latter_obs_snapshot);
 
             if (front_obs_snapshot <= 0.10) {
-                robot->setRobotState(Robot_config::BACKWARD);
+                robot->setRobotState(Robot_config::BACK);
                 return true;
             }
 
             // Simple recovery: rotate in place
             robot->rotating_angle = normalizeAngle(parent_odom.theta_ + M_PI / 4);
-            robot->setRobotState(Robot_config::ROTATE_PLANNING);
+            robot->setRobotState(Robot_config::ROTATE);
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::BACKWARD) {
+        if (robot->getRobotState() == Robot_config::BACK) {
             double front_obs_snapshot, latter_obs_snapshot;
             robot->getObstacleDistanceSafe(front_obs_snapshot, latter_obs_snapshot);
 
             if (front_obs_snapshot >= 0.10) {
-                robot->setRobotState(Robot_config::RECOVERY);
+                robot->setRobotState(Robot_config::RECOVER);
                 return true;
             }
 
@@ -270,7 +272,7 @@ namespace Antipatrea {
 
         // 2. Get current robot velocity
         geometry_msgs::msg::Twist robot_vel;
-        robot_vel.linear.x = parent_odom.velocity_;
+        robot_vel.linear.x = parent_odom.vx_;
         robot_vel.angular.z = parent_odom.angular_velocity_;
 
         // 3. Clear and rebuild obstacles
@@ -388,7 +390,7 @@ namespace Antipatrea {
     void TEB_DDPPlanner::buildObstacles() {
         // Get laser data (in baseline/robot frame)
         // Note: Already filtered in laserScanCallback (valid range + 1cm deduplication)
-        auto laser_points = robot->getLaserDataSafe();
+        auto laser_points = robot->getLaserData();
 
         double cos_theta = std::cos(parent_odom.theta_);
         double sin_theta = std::sin(parent_odom.theta_);
@@ -399,14 +401,14 @@ namespace Antipatrea {
 
         for (const auto &point : laser_points) {
             // Additional distance filter for TEB
-            double dist_sq = point.x() * point.x() + point.y() * point.y();
+            double dist_sq = point[0] * point[0] + point[1] * point[1];
             if (dist_sq > max_dist_sq) {
                 continue;  // Skip distant obstacles
             }
 
             // Transform from baseline to odom
-            double x_odom = parent_odom.x_ + (point.x() * cos_theta - point.y() * sin_theta);
-            double y_odom = parent_odom.y_ + (point.x() * sin_theta + point.y() * cos_theta);
+            double x_odom = parent_odom.x_ + (point[0] * cos_theta - point[1] * sin_theta);
+            double y_odom = parent_odom.y_ + (point[0] * sin_theta + point[1] * cos_theta);
 
             // Create point obstacle and add to container
             auto obs = boost::make_shared<teb_local_planner::PointObstacle>(x_odom, y_odom);
@@ -438,7 +440,7 @@ namespace Antipatrea {
             tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
             state.theta_ = yaw;
 
-            state.velocity_ = traj_point.velocity.linear.x;
+            state.vx_ = traj_point.velocity.linear.x;
             state.angular_velocity_ = traj_point.velocity.angular.z;
             state.valid_ = true;
             trajectory.push_back(state);

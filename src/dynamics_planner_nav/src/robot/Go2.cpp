@@ -2,6 +2,8 @@
 #include "Go2.hpp"
 #include "Go2_callbacks.hpp"
 #include <cmath>
+#include <algorithm>   // std::transform(/force_state 大小写归一)
+#include <limits>      // std::numeric_limits(8 方向 clearance 初值/比较)
 #include <nav_msgs/srv/get_plan.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -9,145 +11,61 @@
 #include "std_srvs/srv/empty.hpp"
 #include "Utility.hpp"
 
-bool Robot_config::setup() {
-    // --- Per-condition diagnostics ---------------------------------------
-    // Evaluate each precondition separately so we can see *which* one blocks
-    // setup() each cycle. getMapData() mutates state (fills `map`, may set
-    // NO_MAP_PLANNING), so we only call it when the earlier conditions hold,
-    // preserving the original short-circuit semantics.
-    const bool gazebo_ok = !checkGazeboPaused();
-    const bool state_ok  = getRobotState() != INITIALIZING;
-    const bool pose_ok   = getPoseState().valid_;
-
-    bool map_ok = false;
-    if (gazebo_ok && state_ok && pose_ok) {
-        map_ok = getMapData();
+// RobotState 枚举 -> 可读名字，供日志显示真实状态(而非裸数字 id)。
+static const char* robotStateName(Robot_config::RobotState s) {
+    switch (s) {
+        case Robot_config::INIT:     return "INIT";
+        case Robot_config::NORMAL:   return "NORMAL";
+        case Robot_config::CAUTIOUS: return "CAUTIOUS";
+        case Robot_config::BLIND:    return "BLIND";
+        case Robot_config::BRAKE:    return "BRAKE";
+        case Robot_config::RECOVER:  return "RECOVER";
+        case Robot_config::ROTATE:   return "ROTATE";
+        case Robot_config::BACK:     return "BACK";
+        case Robot_config::FORWARD:  return "FORWARD";
+        case Robot_config::TEST:     return "TEST";
+        case Robot_config::IDLE:     return "IDLE";
+        default:                     return "UNKNOWN";
     }
-    const bool goal_ok = local_goal_received;
+}
 
-    const bool ready = gazebo_ok && state_ok && pose_ok && map_ok && goal_ok;
+bool Robot_config::setup() {
 
-    RCLCPP_INFO_THROTTLE(
+    if (state_override_active_.load())
+        setRobotState(state_override_value_);
+
+    const PoseState pose = getPoseState();
+
+    const bool gazebo_ok = !checkGazeboPaused();
+    const bool state_ok  = getRobotState() != INIT;
+    const bool pose_ok   = pose.valid_;
+    const bool goal_ok = checkGoalReached(pose.x_, pose.y_);
+    const bool map_ok = checkMapReady(goal_ok);
+    const bool volume_ok = checkVolumeReady();
+
+    const bool ready = gazebo_ok && state_ok && pose_ok && map_ok && goal_ok && volume_ok;
+
+    // [setup] 就绪自检：每周期都打会刷屏、淹没有用日志 → 降为 DEBUG(默认隐藏)，
+    // 需要排查就绪问题时把日志级别设为 DEBUG 即可调出。
+    RCLCPP_DEBUG_THROTTLE(
         this->get_logger(), *this->get_clock(), 1000,
-        "[setup] ready=%d | gazebo_ok=%d state_ok=%d(state=%d) pose_ok=%d "
-        "map_ok=%d(map_src=%d laser=%zu costmap=%zu) goal_ok=%d",
-        ready, gazebo_ok, state_ok, static_cast<int>(getRobotState()),
+        "[setup] ready=%d | gazebo_ok=%d state_ok=%d(state=%s) pose_ok=%d "
+        "map_ok=%d(map_src=%d laser=%zu costmap=%zu) goal_ok=%d volume_ok=%d",
+        ready, gazebo_ok, state_ok, robotStateName(getRobotState()),
         pose_ok, map_ok, static_cast<int>(currentMap),
-        laserData.size(), costmapData.size(), goal_ok);
+        laserData_odom.size(), costmapData.size(), goal_ok, volume_ok);
 
     return ready;
 }
 
-bool Robot_config::checkGazeboPaused() const {
-    std_msgs::msg::String state_msg;
-
-    // In ROS2, check parameter differently
-    bool is_paused = false;
-    // Note: In ROS2, you would typically use a parameter or service
-    // For now, assume not paused
-    if (is_paused) {
-        state_msg.data = "PAUSED";
-        robot_state_pub_->publish(state_msg);
-        return true;
-    }
-
-    publishRobotState();
-    return false;
-}
-
-bool Robot_config::getMapData() {
-    const RobotState state = getRobotState();
-    MapSource mapSource;
-    map.clear();
-
-    if (state == BACKWARD)
-        mapSource = Robot_config::ONLY_COSTMAP_RECEIVED;
-    else
-        mapSource = Robot_config::ONLY_LASER_RECEIVED;
-
-    const auto &primaryData = (mapSource == ONLY_COSTMAP_RECEIVED) ? costmapData : getLaserData();
-    const auto &fallbackData = (mapSource == ONLY_COSTMAP_RECEIVED) ? getLaserData() : costmapData;
-
-    if (!primaryData.empty()) {
-        map = primaryData;
-        currentMap = mapSource;
-    } else if (!fallbackData.empty()) {
-        map = fallbackData;
-        currentMap = (mapSource == ONLY_COSTMAP_RECEIVED) ? ONLY_LASER_RECEIVED : ONLY_COSTMAP_RECEIVED;
-    } else {
-        currentMap = NO_ANY_RECEIVED;
-        setRobotState(NO_MAP_PLANNING);
-        return true;
-    }
-
-    // 拿到地图数据后，如果之前因无数据落入 NO_MAP_PLANNING，恢复正常规划。
-    // 否则状态机会永久卡在 NO_MAP_PLANNING（启动时 laser 未到 → 进 NO_MAP，
-    // 数据到了也回不来），导致 DDP 一直走 handleNoMapPlanning、不避障。
-    if (getRobotState() == NO_MAP_PLANNING) {
-        setRobotState(NORMAL_PLANNING);
-    }
-
-    return !map.empty();
-}
-
-Robot_config::Footprint Robot_config::getFootprint() const {
-    const RobotState state = getRobotState();
-
-    if (state == BACKWARD) {
-        return {POINT_MASS_LENGTH, POINT_MASS_WIDTH};
-    }
-
-    if (currentMap != ONLY_LASER_RECEIVED) {
-        return {POINT_MASS_LENGTH, POINT_MASS_WIDTH};
-    }
-
-    return {ROBOT_LENGTH, ROBOT_WIDTH};
-}
-
-go2::Footprint Robot_config::getRobotVolume() const {
-    // 优先：预测模型从 /predicted_footprint 发来的体积
-    if (footprint_receiver_ && footprint_receiver_->hasReceived()) {
-        return footprint_receiver_->getLatest();
-    }
-
-    // 回退：与 getFootprint() 一致的预设
-    const RobotState state = getRobotState();
-    if (state == BACKWARD || currentMap != ONLY_LASER_RECEIVED) {
-        return go2::Footprint::simpleBox(POINT_MASS_LENGTH, POINT_MASS_WIDTH);
-    }
-    return go2::Footprint::simpleBox(ROBOT_LENGTH, ROBOT_WIDTH);
-}
-
-Robot_config::VelocityLimits Robot_config::getVelocityLimits() const {
-    const RobotState state = getRobotState();
-
-    if (state == BACKWARD) {
-        return {-2.0, 0.0, -2.0, 2.0};
-    }
-
-    if (state == FORWARD) {
-        return {0.0, 2.0, -2.0, 2.0};
-    }
-
-    return {0.0, max_vel_x, -max_vel_theta, max_vel_theta};
-}
-
-std::vector<std::vector<double>> Robot_config::getLaserData() {
-    std::vector<std::vector<double>> out;
-    out.reserve(laserData.size());
-    for (const auto &p: laserData) {
-        out.push_back({static_cast<double>(p.x()), static_cast<double>(p.y())});
-    }
-    return out;
-}
 
 //==============================================================================
 // Constructor: Initialize state and setup ROS2 communication
 //==============================================================================
-Robot_config::Robot_config()
+Robot_config::Robot_config(double bridge_max_velocity)
     : Node("dynamics_planner_nav"),
       algorithm(DWA),
-      currentState(INITIALIZING),
+      currentState(INIT),
       currentMap(ONLY_LASER_RECEIVED),
       local_goal_received(false),
       global_goal_received(false),
@@ -155,23 +73,25 @@ Robot_config::Robot_config()
       canBeSolved(true),
       rotating_angle(0.0),
       dt(0.05),
-      latter_obs(INFINITY),
-      front_obs(INFINITY),
-      recover_times(0) {
+      bridge_max_velocity_(bridge_max_velocity) {
 
-    global_goal.reserve(2);
+    global_goal.reserve(3);
+    global_goal_odom.reserve(3);
     local_goal.reserve(2);
     local_goal_odom.reserve(2);
+
+    // 8 方向 clearance 初值设 INF：首帧激光到来前视为"四周无障碍"，避免被当成贴障。
+    direction_clearance_.fill(std::numeric_limits<double>::infinity());
 
     // Initialize state
     local_goal = {0.0, 0.0};
     robot_state = PoseState(0.0, 0.0, 0.0, 0.0, 0.0, false);
-    actions = {{0.0, 0.0}};
 
     // Initialize time
     normal_to_low_time = this->now();
     low_to_normal_time = this->now();
     low_to_brake_time = this->now();
+    recover_exit_time = this->now();
 
     // ---- Create Callback Handler ----
     callbacks_ = std::make_shared<Go2Callbacks>(this);
@@ -179,22 +99,51 @@ Robot_config::Robot_config()
     // ---- Create Async Task Executor ----
     async_executor_ = std::make_shared<AsyncTaskExecutor>(num_threads);
 
-    // ---- Create predicted-footprint receiver ----
-    // 订阅 /predicted_footprint；未来预测模型发 Float64MultiArray 即生效，
-    // 没有发布者也不影响（getRobotVolume() 会回退到预设矩形）。
-    footprint_receiver_ = std::make_unique<go2::FootprintReceiver>(this);
+    // ---- TF buffer/listener：按激光时间戳查 odom→base_link，修正运动时激光偏移 ----
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // ---- ROS2 Subscriptions ----
-    // Unitree /utlidar/robot_odom and the lidar /front/scan are published with
-    // sensor-data (BEST_EFFORT) QoS. Use SensorDataQoS so we stay compatible
-    // with both BEST_EFFORT and RELIABLE publishers (avoids the
-    // "incompatible QoS / No messages will be sent" warning).
+
+    robot_volume_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+        "/robot_collision_models", 1,
+        std::bind(&Go2Callbacks::robotVolumeCallback, callbacks_.get(), std::placeholders::_1));
+
+    // Debug：/force_state 强制状态注入。值(不区分大小写)：
+    //   NORMAL / CAUTIOUS(别名 LOW_SPEED/LOW) / RECOVER(别名 RECOVERY) -> 强制切到该状态并锁定；AUTO -> 恢复自动状态机。
+    force_state_sub_ = this->create_subscription<std_msgs::msg::String>(
+        "/force_state", 1,
+        [this](const std_msgs::msg::String::SharedPtr msg) {
+            std::string s = msg->data;
+            std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+            if (s == "AUTO") {
+                state_override_active_.store(false);
+                RCLCPP_INFO(this->get_logger(), "[force_state] AUTO：恢复自动状态机");
+            } else if (s == "NORMAL") {
+                state_override_value_ = NORMAL;
+                state_override_active_.store(true);
+                RCLCPP_INFO(this->get_logger(), "[force_state] 锁定 NORMAL");
+            } else if (s == "CAUTIOUS" || s == "LOW_SPEED" || s == "LOW") {
+                state_override_value_ = CAUTIOUS;
+                state_override_active_.store(true);
+                RCLCPP_INFO(this->get_logger(), "[force_state] 锁定 CAUTIOUS");
+            } else if (s == "RECOVER" || s == "RECOVERY") {
+                state_override_value_ = RECOVER;
+                state_override_active_.store(true);
+                RCLCPP_INFO(this->get_logger(), "[force_state] 锁定 RECOVER");
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                    "[force_state] 未知值 '%s'(可用: NORMAL/CAUTIOUS/RECOVER/AUTO)", msg->data.c_str());
+            }
+        });
+
     robot_pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         "/utlidar/robot_odom", rclcpp::SensorDataQoS(),
         std::bind(&Go2Callbacks::odometryCallback, callbacks_.get(), std::placeholders::_1));
 
+    // 改订阅【狗端】已过滤的 /front/scan_filter(自滤+下采样已在狗上完成)，
+    // PC 端 laserScanCallback 不再做任何筛选，直接转世界系坐标收入 laserData_odom。
     laser_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-        "/front/scan", rclcpp::SensorDataQoS(),
+        "/front/scan_filter", rclcpp::SensorDataQoS(),
         std::bind(&Go2Callbacks::laserScanCallback, callbacks_.get(), std::placeholders::_1));
 
     goal_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -222,12 +171,18 @@ Robot_config::Robot_config()
         std::bind(&Go2Callbacks::paramsCallback, callbacks_.get(), std::placeholders::_1));
 
     // ---- ROS2 Publishers ----
-    trajectory_pub_ = this->create_publisher<nav_msgs::msg::Path>("trajectory", 10);
+    trajectory_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("trajectory", 10);
     global_path_pub_ = this->create_publisher<nav_msgs::msg::Path>("global_path", 10);
     local_goal_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("local_goal", 1);
     global_goal_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("global_goal", 1);
     cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 1);
     robot_state_pub_ = this->create_publisher<std_msgs::msg::String>("/robot_mode", 1);
+    // RECOVER 脱困斥力可视化(箭头)：硬斥力(红) + 软斥力(橙)，发到 /recover_repulsion。
+    repulsion_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/recover_repulsion", 1);
+    // perception 激光点可视化：planner 实际使用的 laserData_odom(odom 系)，发到 /perception/laser_points。
+    laser_points_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/perception/laser_points", 1);
+    // 注意：/front/scan_filter 现由【狗端】发布(已过滤)。PC 端不再回发，避免同话题
+    // 双发布者冲突；本节点改为订阅它(见 laser_scan_sub_)。
 
     // ---- ROS2 Service Clients ----
     global_path_clt_ = this->create_client<nav_msgs::srv::GetPlan>("/compute_path_to_pose");
@@ -238,194 +193,182 @@ Robot_config::Robot_config()
 
     // Initialize tuning snapshot from current defaults
     tuning_params_ = getTuningParams();
+
+    setStaticVolumes();
 }
 
-double Robot_config::calculateTheta(const PoseState &state, const std::vector<double> &y) {
-    const double deltaX = y[0] - state.x_;
-    const double deltaY = y[1] - state.y_;
-    const double theta = std::atan2(deltaY, deltaX);
-    const double normalizedTheta = normalize_angle(state.theta_);
-    return std::fabs(normalize_angle(theta - normalizedTheta));
-}
 
-Robot_config::TuningParams Robot_config::getTuningParams() const {
-    TuningParams params{};
-    params.max_vel_x = max_vel_x;
-    params.max_vel_y = max_vel_y;
-    params.max_vel_theta = max_vel_theta;
-    params.vx_sample = static_cast<int>(vx_sample);
-    params.vTheta_samples = static_cast<int>(vTheta_samples);
-    params.path_distance_bias = path_distance_bias;
-    params.goal_distance_bias = goal_distance_bias;
-    params.nr_pairs_ = static_cast<int>(nr_pairs_);
-    params.nr_steps_ = static_cast<int>(nr_steps_);
-    params.linear_stddev = linear_stddev;
-    params.angular_stddev = angular_stddev;
-    params.lambda = lambda;
-    params.local_goal_distance = local_goal_distance;
-    params.distance = distance;
-    params.robot_radius_ = robot_radius_;
-    params.dt = dt;
-    return params;
+void Robot_config::setStaticVolumes() {
+    auto built = go2::buildStaticVolumes(ROBOT_LENGTH, ROBOT_WIDTH, POINT_MASS_LENGTH);
+    models_static_ = std::move(built);
 }
-
-void Robot_config::setTuningParams(const TuningParams &tp) {
-    max_vel_x = tp.max_vel_x;
-    max_vel_y = tp.max_vel_y;
-    max_vel_theta = tp.max_vel_theta;
-    vx_sample = tp.vx_sample;
-    vTheta_samples = tp.vTheta_samples;
-    path_distance_bias = tp.path_distance_bias;
-    goal_distance_bias = tp.goal_distance_bias;
-    nr_pairs_ = tp.nr_pairs_;
-    nr_steps_ = tp.nr_steps_;
-    linear_stddev = tp.linear_stddev;
-    angular_stddev = tp.angular_stddev;
-    lambda = tp.lambda;
-    local_goal_distance = tp.local_goal_distance;
-    distance = tp.distance;
-    robot_radius_ = tp.robot_radius_;
-    dt = tp.dt;
-    tuning_params_ = tp;
-}
-
 
 void Robot_config::setRobotState(RobotState state) {
     currentState = state;
+    setRobotVelocityLimits(state);
+}
+
+void Robot_config::setRobotVelocityLimits(RobotState state) {
 
     switch (state) {
-        case NORMAL_PLANNING:
-            max_vel_x = 1.5;
+        case NORMAL:
+            max_vel_x = bridge_max_velocity_;          max_vel_y = 0.0;  max_vel_theta = 2.0;
             break;
-        case LOW_SPEED_PLANNING:
-            max_vel_x = 0.75;
+        case CAUTIOUS:
+            max_vel_x = bridge_max_velocity_ * 0.5;    max_vel_y = 0.25;  max_vel_theta = 2.5;
             break;
-        case NO_MAP_PLANNING:
-            max_vel_x = 2.0;
+        case RECOVER:
+            max_vel_x = bridge_max_velocity_ * 0.25;   max_vel_y = 0.5;  max_vel_theta = 3.0;
+            break;
+        case BLIND:
+            max_vel_x = bridge_max_velocity_;          max_vel_y = 0.0;  max_vel_theta = 2.0;
             break;
         default:
             break;
     }
 }
 
-Robot_config::PoseState Robot_config::getPoseStateSafe() const {
-    std::lock_guard<std::mutex> lock(robot_state_mutex_);
-    return robot_state;
+Robot_config::VelocityLimits Robot_config::getVelocityLimits() const {
+
+    double back_ratio;
+    switch (getRobotState()) {
+        case RECOVER:  back_ratio = 0.0; break;   // 脱困 ddp 也禁止倒车：倒退仅用于潮汐推开，
+                                                  // 那个用 publishCommand 直接下发，绕过本限制，不受影响。
+        case CAUTIOUS: back_ratio = 0.0; break;
+        default:       back_ratio = 0.0; break;   // NORMAL 及其它
+    }
+    return VelocityLimits{-back_ratio * bridge_max_velocity_, max_vel_x,
+                          -max_vel_theta, max_vel_theta,
+                          -max_vel_y, max_vel_y};
 }
 
-std::vector<double> Robot_config::getTimeIntervalSafe() const {
+const std::vector<go2::Footprint>& Robot_config::getStaticVolumes() const {
+    // models_static_ 构造后不可变(只在构造期 setStaticVolumes() 写一次)，返回 const 引用
+    // 即可，省去每帧激光一次的整份 Footprint 向量拷贝，也无需加锁。
+    return models_static_;
+}
+
+std::vector<std::vector<double>> Robot_config::getLaserData() const {
+    std::lock_guard<std::mutex> lock(laser_data_mutex_);
+    return laserData_odom;
+}
+
+Robot_config::PoseState Robot_config::getPoseStateAt(const rclcpp::Time &stamp) const {
+    // 先拿最新位姿(含速度字段)作基底/回退。
+    PoseState pose = getPoseState();
+
+    if (!tf_buffer_) return pose;
+
+    try {
+        // 查激光采集时刻的 odom→base_link：用该时刻位姿变换激光，消除运动/转弯时的偏移。
+        const auto tf = tf_buffer_->lookupTransform(
+            "odom", "base_link", stamp, rclcpp::Duration::from_seconds(0.05));
+
+        pose.x_ = tf.transform.translation.x;
+        pose.y_ = tf.transform.translation.y;
+
+        const auto &q = tf.transform.rotation;
+        const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+        const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        pose.theta_ = std::atan2(siny_cosp, cosy_cosp);
+    } catch (const std::exception &) {
+        // 查不到(超时/外推/TF 未就绪)：回退到最新位姿，不致命。
+    }
+    return pose;
+}
+
+std::vector<double> Robot_config::getTimeInterval() const {
     std::lock_guard<std::mutex> lock(timeInterval_mutex_);
     return timeInterval;
 }
 
-std::vector<Eigen::Vector2f> Robot_config::getLaserDataSafe() const {
-    std::lock_guard<std::mutex> lock(laser_data_mutex_);
-    return laserData;
-}
-
-std::vector<double> Robot_config::getLaserDataDistanceSafe() const {
-    std::lock_guard<std::mutex> lock(laser_data_mutex_);
-    return laserDataDistance;
-}
-
-void Robot_config::getLocalGoalSafe(std::vector<double> &goal, std::vector<double> &goal_odom) const {
-    std::lock_guard<std::mutex> lock(path_goal_mutex_);
-    goal = local_goal;
-    goal_odom = local_goal_odom;
-}
-
-void Robot_config::getObstacleDistanceSafe(double &front, double &latter) const {
+void Robot_config::getDirectionClearance(std::array<double, DIR_SECTOR_COUNT> &out) const {
     std::lock_guard<std::mutex> lock(obstacle_mutex_);
-    front = front_obs;
-    latter = latter_obs;
+    out = direction_clearance_;
 }
 
-void Robot_config::publishRobotState() const {
-    std_msgs::msg::String state_msg;
-    switch (currentState) {
-        case INITIALIZING: state_msg.data = "INITIALIZING"; break;
-        case NORMAL_PLANNING: state_msg.data = "NORMAL_PLANNING"; break;
-        case LOW_SPEED_PLANNING: state_msg.data = "LOW_SPEED_PLANNING"; break;
-        case NO_MAP_PLANNING: state_msg.data = "NO_MAP_PLANNING"; break;
-        case BRAKE_PLANNING: state_msg.data = "BRAKE_PLANNING"; break;
-        case RECOVERY: state_msg.data = "RECOVERY"; break;
-        case ROTATE_PLANNING: state_msg.data = "ROTATE_PLANNING"; break;
-        case BACKWARD: state_msg.data = "BACKWARD"; break;
-        case FORWARD: state_msg.data = "FORWARD"; break;
-        case TEST: state_msg.data = "TEST"; break;
-        case IDLE: state_msg.data = "IDLE"; break;
-        default: state_msg.data = "UNKNOWN"; break;
-    }
-    robot_state_pub_->publish(state_msg);
-}
+double Robot_config::mostOpenDirection(double &ux, double &uy) const {
+    std::array<double, DIR_SECTOR_COUNT> clearance;
+    getDirectionClearance(clearance);
 
-void Robot_config::viewTrajectories(std::vector<PoseState> &trajectories, int nr_steps_, double theta_, std::vector<double> &t) const {
-    if (!trajectory_pub_) return;
-
-    nav_msgs::msg::Path path_msg;
-    path_msg.header.stamp = this->now();
-    path_msg.header.frame_id = "odom";
-
-    int count = std::min(nr_steps_, static_cast<int>(trajectories.size()));
-    for (int i = 0; i < count; ++i) {
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header = path_msg.header;
-        pose.pose.position.x = trajectories[i].x_;
-        pose.pose.position.y = trajectories[i].y_;
-        pose.pose.position.z = 0.0;
-
-        double yaw = trajectories[i].theta_ + theta_;
-        pose.pose.orientation.x = 0.0;
-        pose.pose.orientation.y = 0.0;
-        pose.pose.orientation.z = std::sin(yaw / 2.0);
-        pose.pose.orientation.w = std::cos(yaw / 2.0);
-
-        path_msg.poses.push_back(pose);
+    // 只在【已观测到】的方向里选最开阔的：余量为无穷大表示该扇区这一帧没有任何激光点，
+    // 属于未知区域(例如真机前向激光看不到的身后)，朝那里挪等于盲走，必须排除。
+    int best_direction = -1;
+    double best_clearance = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < DIR_SECTOR_COUNT; ++i) {
+        const double c = clearance[i];
+        if (std::isinf(c)) continue;                 // 未观测方向：跳过
+        if (c > best_clearance) { best_clearance = c; best_direction = i; }
     }
 
-    trajectory_pub_->publish(path_msg);
-    (void)t;  // Time interval not used in visualization
-}
-
-void Robot_config::viewTrajectories(std::vector<PoseState> &trajectories, int nr_steps_, std::vector<double> &t) const {
-    viewTrajectories(trajectories, nr_steps_, 0.0, t);
-}
-
-void Robot_config::view_Goal(std::vector<double> &goal, std::vector<double> &goal1) const {
-    if (!local_goal_pub_ || !global_goal_pub_) return;
-
-    visualization_msgs::msg::Marker local_marker;
-    local_marker.header.stamp = this->now();
-    local_marker.header.frame_id = "odom";
-    local_marker.ns = "local_goal";
-    local_marker.id = 0;
-    local_marker.type = visualization_msgs::msg::Marker::SPHERE;
-    local_marker.action = visualization_msgs::msg::Marker::ADD;
-    local_marker.scale.x = 0.2;
-    local_marker.scale.y = 0.2;
-    local_marker.scale.z = 0.2;
-    local_marker.color.r = 0.0f;
-    local_marker.color.g = 1.0f;
-    local_marker.color.b = 0.0f;
-    local_marker.color.a = 1.0f;
-
-    if (goal.size() >= 2) {
-        local_marker.pose.position.x = goal[0];
-        local_marker.pose.position.y = goal[1];
-        local_marker.pose.position.z = 0.1;
-        local_goal_pub_->publish(local_marker);
+    // 所有方向都未观测(完全没有激光) → 没有可信的开阔方向，交给调用方原地转扫描。
+    if (best_direction < 0) {
+        ux = 0.0;
+        uy = 0.0;
+        return -1.0;
     }
 
-    visualization_msgs::msg::Marker global_marker = local_marker;
-    global_marker.ns = "global_goal";
-    global_marker.color.r = 1.0f;
-    global_marker.color.g = 0.0f;
-
-    if (goal1.size() >= 2) {
-        global_marker.pose.position.x = goal1[0];
-        global_marker.pose.position.y = goal1[1];
-        global_marker.pose.position.z = 0.1;
-        global_goal_pub_->publish(global_marker);
-    }
+    // 扇区 -> 机体系单位方向：方位角 = best_direction * 45°(CCW)。
+    //   DIR_FRONT=0°(+x前) / DIR_LEFT=90°(+y左) / DIR_BACK=180°(-x后) / DIR_RIGHT=270°(-y右)。
+    const double ang = static_cast<double>(best_direction) * (M_PI / 4.0);
+    ux = std::cos(ang);
+    uy = std::sin(ang);
+    return best_clearance;   // 该方向余量(m)，供调用方判断是否四周都堵
 }
+
+double Robot_config::computeHardRepulsion(double hard_dist, double &fx, double &fy) const {
+    std::array<double, DIR_SECTOR_COUNT> clearance;
+    getDirectionClearance(clearance);
+
+    fx = 0.0;
+    fy = 0.0;
+    for (int i = 0; i < DIR_SECTOR_COUNT; ++i) {
+        const double c = clearance[i];
+        // 比硬斥力边界远(含 +INF 无障碍)：不在硬区，不产生斥力。
+        if (!(c < hard_dist)) continue;   // 用 !(c<hard) 同时挡掉 NaN
+
+        // 越近(甚至 c<0 已侵入)，强度越大：weight = hard_dist − 余量 (>0)。
+        const double weight = hard_dist - c;
+
+        // 扇区 i → 机体系方位角(CCW，0=前)；斥力朝该方向的【反方向】= -(cos, sin)。
+        const double ang = static_cast<double>(i) * (M_PI / 4.0);
+        fx -= std::cos(ang) * weight;
+        fy -= std::sin(ang) * weight;
+    }
+    return std::hypot(fx, fy);
+}
+
+double Robot_config::computeEscapeDirection(double goal_angle, double goal_gain,
+                                            double &ux, double &uy) const {
+    std::array<double, DIR_SECTOR_COUNT> clearance;
+    getDirectionClearance(clearance);
+
+    // 空旷度截顶(m)：远处/超大余量不让其无限主导，超过此值按此值计权。
+    constexpr double kClearCap = 1.0;
+
+    double ex = 0.0, ey = 0.0;
+    for (int i = 0; i < DIR_SECTOR_COUNT; ++i) {
+        const double c = clearance[i];
+        if (std::isinf(c)) continue;                 // 未观测方向：朝那挪等于盲走，跳过(同 mostOpenDirection)
+        // 空旷度权重：余量越大越想去；<0(已侵入)按 0，不往侵入方向走。
+        const double w_open = std::min(std::max(c, 0.0), kClearCap);
+        if (w_open <= 0.0) continue;
+        // 扇区 i → 机体系方位角(CCW，0=前)。
+        const double ang = static_cast<double>(i) * (M_PI / 4.0);
+        // goal 门控引力：朝 goal 的方向额外加成(乘在空旷度上 → 朝障碍方向 w_open≈0，引力压不过避障)。
+        const double w_goal = 1.0 + goal_gain * std::max(0.0, std::cos(ang - goal_angle));
+        ex += std::cos(ang) * w_open * w_goal;
+        ey += std::sin(ang) * w_open * w_goal;
+    }
+
+    const double mag = std::hypot(ex, ey);
+    if (mag < 1e-6) { ux = 0.0; uy = 0.0; return 0.0; }   // 四周全未观测/无开阔 → 交调用方兜底
+    ux = ex / mag;
+    uy = ey / mag;
+    return mag;
+}
+
+
+
+
 

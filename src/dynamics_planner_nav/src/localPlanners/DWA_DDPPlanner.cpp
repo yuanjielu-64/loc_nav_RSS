@@ -8,7 +8,7 @@
 
 namespace Antipatrea {
     void DDPDWAPlanner::updateRobotState() {
-        parent = {0, 0, 0, robot->getPoseState().velocity_, robot->getPoseState().angular_velocity_, true};
+        parent = {0, 0, 0, robot->getPoseState().vx_, robot->getPoseState().vy_, robot->getPoseState().angular_velocity_, true};
         parent_odom = robot->getPoseState();
         timeInterval = robot->timeInterval;
     }
@@ -28,17 +28,17 @@ namespace Antipatrea {
         commonParameters(*robot);
 
         switch (robot->getRobotState()) {
-            case Robot_config::NO_MAP_PLANNING:
+            case Robot_config::BLIND:
                 return handleNoMapPlanning(cmd_vel);
 
-            case Robot_config::NORMAL_PLANNING:
+            case Robot_config::NORMAL:
                 return handleNormalSpeedPlanning(cmd_vel, best_traj, dt);
 
-            case Robot_config::LOW_SPEED_PLANNING:
+            case Robot_config::CAUTIOUS:
                 return handleLowSpeedPlanning(cmd_vel, best_traj, dt);
 
             default:
-                return handleAbnormalPlaning(cmd_vel, best_traj, dt);
+                return handleAbnormalPlanning(cmd_vel, best_traj, dt);
         }
     }
 
@@ -51,7 +51,7 @@ namespace Antipatrea {
         double angular = std::clamp(angle_to_goal, -1.0, 1.0);
         angular = (angular > 0) ? std::max(angular, 0.1) : std::min(angular, -0.1);
 
-        publishCommand(cmd_vel, robot->max_vel_x, angular);
+        publishCommand(*robot, cmd_vel, robot->max_vel_x, angular);
         return true;
     }
 
@@ -62,19 +62,19 @@ namespace Antipatrea {
 
         auto result = dwa_planning(parent, parent_odom, best_traj, dt);
 
-        robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
+        robot->viewTrajectories(best_traj.first, nr_steps_);
 
         if (result == false) {
-            publishCommand(cmd_vel, 0.5 , 0);
+            publishCommand(*robot, cmd_vel, 0.5 , 0);
         } else {
-            publishCommand(cmd_vel, best_traj.first[1].velocity_ , best_traj.first[1].angular_velocity_);
+            publishCommand(*robot, cmd_vel, best_traj.first[1].vx_ , best_traj.first[1].vy_ , best_traj.first[1].angular_velocity_);
         }
         // if (result == false) {
-        //     robot->setRobotState(Robot_config::BRAKE_PLANNING);
-        //     publishCommand(cmd_vel, robot->getPoseState().velocity_, robot->getPoseState().angular_velocity_);
+        //     robot->setRobotState(Robot_config::BRAKE);
+        //     publishCommand(*robot, cmd_vel, robot->getPoseState().vx_, robot->getPoseState().angular_velocity_);
         // } else {
         //     auto output_command = cal_weight_output_commands(best_traj.first);
-        //     publishCommand(cmd_vel, output_command[0], output_command[1]);
+        //     publishCommand(*robot, cmd_vel, output_command[0], output_command[1]);
         // }
 
         return true;
@@ -87,55 +87,57 @@ namespace Antipatrea {
 
         auto result = dwa_planning(parent, parent_odom, best_traj, dt);
 
-        robot->viewTrajectories(best_traj.first, nr_steps_, 0.0, timeInterval);
+        robot->viewTrajectories(best_traj.first, nr_steps_);
 
         if (!result) {
-            robot->setRobotState(Robot_config::BRAKE_PLANNING);
-            publishCommand(cmd_vel, 0, 0);
+            robot->setRobotState(Robot_config::BRAKE);
+            publishCommand(*robot, cmd_vel, 0, 0);
         } else {
             auto output_command = cal_weight_output_commands(best_traj.first);
-            publishCommand(cmd_vel, output_command[0], output_command[1]);
+            publishCommand(*robot, cmd_vel, output_command[0], output_command[1]);
         }
         return true;
     }
 
-    bool DDPDWAPlanner::handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel,
+    bool DDPDWAPlanner::handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel,
                                               std::pair<std::vector<PoseState>, bool> &best_traj, double dt) {
         (void)dt;
 
-        if (robot->getRobotState() == Robot_config::BRAKE_PLANNING) {
-            double vel = robot->getPoseState().velocity_;
+        if (robot->getRobotState() == Robot_config::BRAKE) {
+            double vel = robot->getPoseState().vx_;
             if (vel > 0.01)
-                publishCommand(cmd_vel, -0.1, 0.0);
+                publishCommand(*robot, cmd_vel, -0.1, 0.0);
             else {
-                publishCommand(cmd_vel, 0.0, 0.0);
-                robot->setRobotState(Robot_config::RECOVERY);
+                publishCommand(*robot, cmd_vel, 0.0, 0.0);
+                robot->setRobotState(Robot_config::RECOVER);
             }
 
             return true;
         }
 
 
-        if (robot->getRobotState() == Robot_config::ROTATE_PLANNING) {
+        if (robot->getRobotState() == Robot_config::ROTATE) {
 
             double angle = normalizeAngle(robot->rotating_angle - robot->getPoseState().theta_);
 
             if (fabs(angle) <= 0.10) {
-                robot->setRobotState(Robot_config::NORMAL_PLANNING);
+                robot->setRobotState(Robot_config::NORMAL);
                 return true;
             }
 
             double z = angle > 0 ? std::min(angle, 1.0) : std::max(angle, -1.0);
             z = z > 0 ? std::max(z, 0.5) : std::min(z, -0.5);
-            publishCommand(cmd_vel, 0.0, z);
+            publishCommand(*robot, cmd_vel, 0.0, z);
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::RECOVERY) {
+        if (robot->getRobotState() == Robot_config::RECOVER) {
             bool results;
 
-            if (robot->front_obs <= 0.10) {
-                robot->setRobotState(Robot_config::BACKWARD);
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            if (dir_clearance[Robot_config::DIR_FRONT] <= 0.10) {
+                robot->setRobotState(Robot_config::BACK);
                 return true;
             }
 
@@ -148,20 +150,22 @@ namespace Antipatrea {
 
             robot->rotating_angle = normalizeAngle(robot->getPoseState().theta_ + best_theta);
 
-            robot->viewTrajectories(best_traj.first, nr_steps_, best_theta, timeInterval);
-            robot->setRobotState(Robot_config::ROTATE_PLANNING);
+            robot->viewTrajectories(best_traj.first, nr_steps_);
+            robot->setRobotState(Robot_config::ROTATE);
         }
 
-        if (robot->getRobotState() == Robot_config::BACKWARD) {
+        if (robot->getRobotState() == Robot_config::BACK) {
 
             frontBackParameters(*robot);
 
-            if (robot->front_obs >= 0.10) {
-                robot->setRobotState(Robot_config::RECOVERY);
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            if (dir_clearance[Robot_config::DIR_FRONT] >= 0.10) {
+                robot->setRobotState(Robot_config::RECOVER);
                 return true;
             }
 
-            publishCommand(cmd_vel, -0.3, 0);
+            publishCommand(*robot, cmd_vel, -0.3, 0);
         }
 
         // if (robot->getRobotState() == Robot_config::FORWARD) {
@@ -171,7 +175,7 @@ namespace Antipatrea {
         //     frontBackParameters(*robot);
         //
         //     if (robot->latter_obs >= 0.15) {
-        //         robot->setRobotState(Robot_config::RECOVERY);
+        //         robot->setRobotState(Robot_config::RECOVER);
         //         return true;
         //     }
         //
@@ -180,20 +184,16 @@ namespace Antipatrea {
         //     robot->viewTrajectories(best_traj.first, nr_steps_, 0.0);
         //
         //     if (result == false)
-        //         publishCommand(cmd_vel, 0.1, 0.0);
+        //         publishCommand(*robot, cmd_vel, 0.1, 0.0);
         //     else
-        //         publishCommand(cmd_vel, best_traj.first.front().velocity_, best_traj.first.front().angular_velocity_);
+        //         publishCommand(*robot, cmd_vel, best_traj.first.front().vx_, best_traj.first.front().angular_velocity_);
         // }
 
         return true;
     }
 
 
-    void DDPDWAPlanner::publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular) {
-        cmd_vel.linear.x = linear;
-        cmd_vel.angular.z = angular;
-        robot->Control()->publish(cmd_vel);
-    }
+    // publishCommand 已统一到 LocalPlannerBase(static)，DDPDWAPlanner 不再保留副本。
 
     std::vector<double> DDPDWAPlanner::cal_weight_output_commands(std::vector<PoseState> &traj) {
         std::vector<double> output_commands;
@@ -216,7 +216,7 @@ namespace Antipatrea {
                 closestIndex = i;
             }
         }
-        output_commands.push_back(traj[closestIndex].velocity_);
+        output_commands.push_back(traj[closestIndex].vx_);
         output_commands.push_back(traj[closestIndex].angular_velocity_);
 
         return output_commands;
@@ -255,7 +255,7 @@ namespace Antipatrea {
             if (result == false)
                 continue;
 
-            robot->viewTrajectories(traj.first, nr_steps_, state_.theta_, timeInterval);
+            robot->viewTrajectories(traj.first, nr_steps_);
 
             const Cost cost = evaluate_trajectory(traj.first, _, tmp_);
             costs.push_back(cost);
@@ -270,8 +270,9 @@ namespace Antipatrea {
         Cost min_cost(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e6);
 
         if (available_traj_count == 0) {
-            std::cerr << "[ERROR] When a collision occurs, the robot cannot find any path during rotation" << std::endl;
-            best_traj.first = generateTrajectory(state, state_odom, 0.0, 0.0).first;
+            RCLCPP_ERROR_STREAM_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                "When a collision occurs, the robot cannot find any path during rotation");
+            best_traj.first = generateTrajectory(state, state_odom, 0.0, 0.0, 0.0).first;
             results = false;
             return best_theta;
         } else {
@@ -338,7 +339,7 @@ namespace Antipatrea {
 
         Cost min_cost(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e6);
 
-        Window dw = calc_dynamic_window(state, dt);
+        Window dw = calc_dynamic_window(*robot, state, dt);
 
         best_traj.first.reserve(nr_steps_);
 
@@ -349,6 +350,12 @@ namespace Antipatrea {
                 std::max(
                     (dw.max_angular_velocity_ - dw.min_angular_velocity_) / (w_steps_ - 1),
                     DBL_EPSILON);
+
+        // 全向侧移网格分辨率(vy_steps_>=2 时有效)。
+        const double lateral_resolution =
+                (vy_steps_ > 1)
+                    ? std::max((dw.max_lateral_velocity_ - dw.min_lateral_velocity_) / (vy_steps_ - 1), DBL_EPSILON)
+                    : 0.0;
 
         //Logger::m_out << "dw.max_angular_velocity_ " << dw.max_angular_velocity_ << "  dw.min_angular_velocity_ "  << dw.min_angular_velocity_ << std::endl;
 
@@ -371,11 +378,11 @@ namespace Antipatrea {
             thread_trajectories[i].reserve((end - start) * (v_steps_ + 1));
 
             threads.emplace_back(
-                [this, i, start, end, &state, &state_odom, velocity_resolution, angularVelocity_resolution, &dw, &
+                [this, i, start, end, &state, &state_odom, velocity_resolution, angularVelocity_resolution, lateral_resolution, &dw, &
                     thread_costs, &
                     thread_trajectories]() {
                     this->process_segment(i, start, end, state, state_odom, velocity_resolution,
-                                          angularVelocity_resolution, dw,
+                                          angularVelocity_resolution, lateral_resolution, dw,
                                           thread_costs[i], thread_trajectories[i]);
                 });
         }
@@ -410,7 +417,8 @@ namespace Antipatrea {
         }
 
         if (costs.empty()) {
-            std::cerr << "[ERROR] No available trajectory after cleaning." << std::endl;
+            RCLCPP_ERROR_STREAM_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                "No available trajectory after cleaning.");
             best_traj.second = false;
             return false;
         }
@@ -428,7 +436,7 @@ namespace Antipatrea {
         best_traj.second = true;
 
 
-        //Logger::m_out << "best_traj velocity  " << best_traj.first.front().velocity_ << " best_traj anglar velocity "  << best_traj.first.front().angular_velocity_ << std::endl;
+        //Logger::m_out << "best_traj velocity  " << best_traj.first.front().vx_ << " best_traj anglar velocity "  << best_traj.first.front().angular_velocity_ << std::endl;
 
         //Logger::m_out << "multi_thread_3 " << Timer::Elapsed(d_t) << std::endl;
         return true;
@@ -436,7 +444,7 @@ namespace Antipatrea {
 
     void DDPDWAPlanner::process_segment(int thread_id, int start, int end, PoseState &state,
                                         PoseState &state_odom, double velocity_resolution,
-                                        double angularVelocity_resolution, Window &dw,
+                                        double angularVelocity_resolution, double lateral_resolution, Window &dw,
                                         std::vector<Cost> &thread_costs,
                                         std::vector<std::pair<std::vector<PoseState>, std::vector<
                                             PoseState> > > &thread_trajectories) {
@@ -450,19 +458,22 @@ namespace Antipatrea {
             double dist = -1;
             std::vector<double> last_position;
             for (int j = v_steps_; j > 0; j--) {
-                std::pair<std::vector<PoseState>, std::vector<PoseState> > trajectories;
-
                 const double v = dw.min_velocity_ + velocity_resolution * j;
 
-                // v = 1.05  w = -1.35
-                trajectories = generateTrajectory(state, state_odom, v, w);
+                // 全向：在每个 (v,w) 上再扫一个小的侧移网格(含 0=直行)。
+                for (int k = 0; k < vy_steps_; ++k) {
+                    const double vy = (vy_steps_ <= 1)
+                                          ? 0.0
+                                          : (dw.min_lateral_velocity_ + lateral_resolution * k);
 
-                // robot->viewTrajectories(trajectories.first, nr_steps_, 0.0, timeInterval);
+                    std::pair<std::vector<PoseState>, std::vector<PoseState> > trajectories;
+                    trajectories = generateTrajectory(state, state_odom, v, vy, w);
 
-                const Cost cost = evaluate_trajectory(trajectories, dist, last_position);
+                    const Cost cost = evaluate_trajectory(trajectories, dist, last_position);
 
-                thread_costs.emplace_back(cost);
-                thread_trajectories.emplace_back(trajectories);
+                    thread_costs.emplace_back(cost);
+                    thread_trajectories.emplace_back(trajectories);
+                }
             }
 
             if (dw.min_angular_velocity_ < 0.0 && 0.0 < dw.max_angular_velocity_) {
@@ -471,7 +482,7 @@ namespace Antipatrea {
                 std::pair<std::vector<PoseState>, std::vector<PoseState> > trajectories;
                 const double v = dw.min_velocity_ + velocity_resolution * i;
 
-                trajectories = generateTrajectory(state, state_odom, v, 0.0);
+                trajectories = generateTrajectory(state, state_odom, v, 0.0, 0.0);
 
                 const Cost cost = evaluate_trajectory(trajectories, dist, last_position);
 
@@ -495,9 +506,9 @@ namespace Antipatrea {
 
         n = 0.0;
         for (int i = 0; i < nr_steps_; ++i) {
-            motion(state_, 0.0000001, angular_velocity, timeInterval[i]);
+            motion(state_, 0.0000001, 0.0, angular_velocity, timeInterval[i]);
             trajectory.first[i] = state_;
-            motion(state_odom_, 0.0000001, angular_velocity, timeInterval[i]);
+            motion(state_odom_, 0.0000001, 0.0, angular_velocity, timeInterval[i]);
             trajectory.second[i] = state_odom_;
             //n++;
         }
@@ -506,8 +517,8 @@ namespace Antipatrea {
     }
 
     std::pair<std::vector<PoseState>, std::vector<PoseState> >
-    DDPDWAPlanner::generateTrajectory(PoseState &state, PoseState &state_odom, const double v,
-                                      const double w) {
+    DDPDWAPlanner::generateTrajectory(PoseState &state, PoseState &state_odom, const double vx,
+                                      const double vy, const double w) {
         std::pair<std::vector<PoseState>, std::vector<PoseState> > trajectory;
         trajectory.first.resize(nr_steps_);
         trajectory.second.resize(nr_steps_);
@@ -515,9 +526,9 @@ namespace Antipatrea {
         PoseState state_odom_ = state_odom;
 
         for (int i = 0; i < nr_steps_; i++) {
-            motion(state_, v + 0.00001, w, timeInterval[i]);
+            motion(state_, vx + 0.00001, vy, w, timeInterval[i]);
             trajectory.first[i] = state_;
-            motion(state_odom_, v + 0.00001, w, timeInterval[i]);
+            motion(state_odom_, vx + 0.00001, vy, w, timeInterval[i]);
             trajectory.second[i] = state_odom_;
         }
 
@@ -598,10 +609,10 @@ namespace Antipatrea {
         for (size_t i = 0; i < traj.size() - 2; i++)
             d += Algebra::PointDistance(2, &traj[i].pose()[0], &traj[i + 1].pose()[0]);
 
-        if (d <= distance)
+        if (d <= min_traj_length_)
             return 1e6;
 
-        std::vector<std::vector<double>> local_path = robot->global_paths;
+        std::vector<std::vector<double>> local_path = robot->global_paths_odom;
         if (local_path.empty()) {
             // std::cerr << "Local path is empty!" << std::endl;
             return 0;
@@ -614,12 +625,12 @@ namespace Antipatrea {
                 if (point.size() < 2) continue; // Ensure the point has at least x and y coordinates
                 double dx = state.x_ - point[0];
                 double dy = state.y_ - point[1];
-                double distance = std::sqrt(dx * dx + dy * dy);
-                if (distance < min_distance) {
-                    min_distance = distance;
+                double pt_dist = std::sqrt(dx * dx + dy * dy);
+                if (pt_dist < min_distance) {
+                    min_distance = pt_dist;
                 }
             }
-            d += min_distance * weights[i]; // Add the minimum distance to total
+            d += min_distance * weights[i]; // Add the minimum pt_dist to total
             i++;
         }
 
@@ -640,15 +651,15 @@ namespace Antipatrea {
     }
 
     double DDPDWAPlanner::calc_obs_cost(const std::vector<PoseState> &traj) {
-        auto obss = robot->getDataMap();
+        const auto &obss = robot->getDataMap();
         auto distances = robot->laserDataDistance;
         bool flag = (distances.size() == obss.size());
         auto footprint = robot->getFootprint();
         auto velocity = robot->getVelocityLimits();
         double v = velocity.max_linear;
 
-        double halfLength = footprint.length / 2.0;
-        double halfWidth = footprint.width / 2.0;
+        double halfLength = footprint[0] / 2.0;
+        double halfWidth = footprint[1] / 2.0;
 
         double min_dist = obs_range_;
 
@@ -735,7 +746,7 @@ namespace Antipatrea {
             return 0.0;
         double d = 0;
         for (int i = 10; i < (int)traj.size() - 1; i++) {
-            d += Algebra::PointDistance(2, &traj[i].pose()[0], &local_goal[0]) * weights[i];
+            d += Algebra::PointDistance(2, &traj[i].pose()[0], &local_goal_odom[0]) * weights[i];
         }
         return d / 10;
     }
@@ -743,46 +754,33 @@ namespace Antipatrea {
     double DDPDWAPlanner::calc_speed_cost(const std::vector<PoseState> &trajs) {
         if (!use_speed_cost_)
             return 0.0;
-        const Window dw = calc_dynamic_window(parent, dt);
-        return dw.max_velocity_ - trajs.front().velocity_;
+        const Window dw = calc_dynamic_window(*robot, parent, dt);
+        return dw.max_velocity_ - trajs.front().vx_;
     }
 
     double DDPDWAPlanner::calc_ori_cost(const std::vector<PoseState> &traj) {
         if (!use_ori_cost_)
             return 0.0;
-        double theta = calculateTheta(traj[traj.size() - 1], &local_goal[0]);
+        double theta = calculateTheta(traj[traj.size() - 1], &local_goal_odom[0]);
         return fabs(theta);
     }
 
 
-    void DDPDWAPlanner::motion(PoseState &state, const double velocity, const double angular_velocity, double t) {
-        double v = updateVelocity(state.velocity_, velocity, maxAccelerSpeed, minAccelerSpeed, t);
-        double w = updateVelocity(state.angular_velocity_, angular_velocity, maxAngularAccelerSpeed,
-                                  minAngularAccelerSpeed, t);
-
+    void DDPDWAPlanner::motion(PoseState &state, const double vx_cmd, const double vy_cmd, const double angular_velocity, double t) {
+        double vx = updateVelocity(state.vx_, vx_cmd, maxAccelerSpeed, minAccelerSpeed, t);
+        double vy = updateVelocity(state.vy_, vy_cmd, maxAccelerSpeed, minAccelerSpeed, t);
+        double w  = updateVelocity(state.angular_velocity_, angular_velocity, maxAngularAccelerSpeed, minAngularAccelerSpeed, t);
+        // 中点积分 + 机体系(vx 前向, vy 左向)旋转到世界系。
+        const double theta_mid = state.theta_ + 0.5 * w * t;
+        const double c = std::cos(theta_mid), s = std::sin(theta_mid);
+        state.x_ += (vx * c - vy * s) * t;
+        state.y_ += (vx * s + vy * c) * t;
         state.theta_ += w * t;
-        state.x_ += v * cos(state.theta_) * t;
-        state.y_ += v * sin(state.theta_) * t;
-        state.velocity_ = v;
+        state.vx_ = vx;
+        state.vy_ = vy;
         state.angular_velocity_ = w;
 
         state.theta_ = normalizeAngle(state.theta_);
     }
 
-    DDPDWAPlanner::Window DDPDWAPlanner::calc_dynamic_window(PoseState &state, double dt) {
-        Window window;
-        auto velocity = robot->getVelocityLimits();
-
-        window.min_velocity_ = std::max((state.velocity_ + minAccelerSpeed * dt),
-                                        velocity.min_linear);
-        window.max_velocity_ = std::min((state.velocity_ + maxAccelerSpeed * dt),
-                                        velocity.max_linear);
-
-        window.min_angular_velocity_ = std::max(
-            (state.angular_velocity_ + minAngularAccelerSpeed * dt), velocity.min_angular);
-        window.max_angular_velocity_ = std::min(
-            (state.angular_velocity_ + maxAngularAccelerSpeed * dt), velocity.max_angular);
-
-        return window;
-    }
 }

@@ -56,6 +56,15 @@ cleanup() {
     echo "Stopping stack..."
     [[ -n "${LOC_PID:-}"    ]] && kill "$LOC_PID"    2>/dev/null || true
     [[ -n "${CAM_PID:-}"    ]] && kill "$CAM_PID"    2>/dev/null || true
+    # CRITICAL: $LOC_PID/$CAM_PID are only the `ros2 run`/`ros2 launch` WRAPPERS.
+    # ros2 launch frequently does NOT forward SIGTERM to the actual node, so the
+    # node binary is orphaned and keeps running at full CPU. Each supervise
+    # restart then leaks one orphan -> over a long session they pile up
+    # (observed: 6x front_camera_node ~300% CPU). Reap the real node binaries by
+    # path. Safe here: autostart holds a single-instance flock, so only ONE
+    # stack ever exists; we are not killing a peer instance.
+    pkill -f "go2_front_camera/lib/go2_front_camera/front_camera_node"       2>/dev/null || true
+    pkill -f "nav_loc_localization/lib/nav_loc_localization/odom_tf_broadcaster" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup INT TERM

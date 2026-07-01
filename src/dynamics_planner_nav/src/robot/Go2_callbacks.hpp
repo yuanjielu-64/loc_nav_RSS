@@ -39,16 +39,12 @@ public:
 
     void velocityCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
 
+    // 机器人真实体积接收：/robot_collision_models -> 真实外包碰撞体积(N=1/4/6/8/10)，
+    // 在回调里直接解析并写入 models_dynamic_，同时置 volume_received。
+    void robotVolumeCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+
 private:
     Robot_config* robot_;  // Pointer to parent robot instance
-
-    // Helper methods for globalPathCallback
-    bool handleEmptyGlobalPath();
-    void processValidGlobalPath(const nav_msgs::msg::Path::SharedPtr msg);
-    double computeLookaheadThreshold() const;
-
-    // 到达判定：传入当前(odom)位置，若离 global goal 在阈值内则锁存 goal_reached 并停止规划。
-    void checkGoalReached(double cur_x, double cur_y);
 };
 
 #endif // DYNAMICS_PLANNER_NAV_GO2_CALLBACKS_HPP

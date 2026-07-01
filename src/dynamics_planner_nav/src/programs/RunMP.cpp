@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <string>
 #include <algorithm>
+#include <cstdlib>
 
 namespace {
     Robot_config::Algorithm parse_algorithm(std::string s) {
@@ -40,18 +41,22 @@ int main(int argc, char **argv) {
     // Initialize ROS2
     rclcpp::init(argc, argv);
 
-    // Resolve planner selection from CLI
+    // Resolve planner selection + max speed from CLI
     std::string planner_arg;
+    double max_speed = -1.0;   // <0 表示未指定
     for (int i = 1; i + 1 < argc; ++i) {
         const std::string flag = argv[i];
         if (flag == "--planner" || flag == "-p") {
             planner_arg = argv[i + 1];
-            break;
+        } else if (flag == "--max-speed" || flag == "-m") {
+            max_speed = std::atof(argv[i + 1]);
         }
     }
 
-    // Create robot node
-    auto robot = std::make_shared<Robot_config>();
+    // Create robot node. -m(桥最大线速度)在构造时定好；未指定则用默认 2.0。
+    const double bridge_max_vel = (max_speed > 0.0) ? max_speed : 2.0;
+    auto robot = std::make_shared<Robot_config>(bridge_max_vel);
+    RCLCPP_INFO(robot->get_logger(), "Bridge max velocity = %.2f m/s (from -m)", bridge_max_vel);
 
     // Fallback to ROS2 parameter if not set via CLI
     if (planner_arg.empty()) {
@@ -61,6 +66,7 @@ int main(int argc, char **argv) {
 
     const auto algo = parse_algorithm(planner_arg);
     robot->setAlgorithm(algo);
+
 
     double n = 20;  // 20 Hz
     robot->setDt(1.0/n);
@@ -125,16 +131,27 @@ int main(int argc, char **argv) {
     }
 
     while (rclcpp::ok()) {
+        // 记录本次迭代的工作耗时(spin_some + setup + solve，不含 rate.sleep 的等待)。
+        Antipatrea::Timer::Clock loop_clk;
+        Antipatrea::Timer::Start(loop_clk);
+
         rclcpp::spin_some(robot);
 
         if (!robot->setup()) {
-            if (robot->getRobotState() == Robot_config::BRAKE_PLANNING)
+            if (robot->getRobotState() == Robot_config::BRAKE)
                 rate.sleep();
             continue;
         }
 
         // Call selected planner solve function
         solve_step();
+
+        // 本次迭代工作耗时(ms)。属性能诊断、与脱困分析无关 → 降为 DEBUG(默认隐藏)，避免刷屏。
+        const double loop_ms = Antipatrea::Timer::Elapsed(loop_clk) * 1000.0;
+        RCLCPP_DEBUG_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000,
+                             "[loop] 本次迭代耗时=%.2f ms (预算 %.1f ms @ %.0f Hz)",
+                             loop_ms, 1000.0 / n, n);
+
         rate.sleep();
     }
 

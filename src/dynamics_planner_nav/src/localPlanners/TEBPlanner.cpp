@@ -82,9 +82,9 @@ namespace Antipatrea {
 
     void TEBPlanner::updateRobotState() {
         // Thread-safe read: get snapshot of current state
-        auto current_state = robot->getPoseStateSafe();
+        auto current_state = robot->getPoseState();
 
-        parent = {0, 0, 0, current_state.velocity_, current_state.angular_velocity_, true};
+        parent = {0, 0, 0, current_state.vx_, current_state.angular_velocity_, true};
         parent_odom = current_state;
     }
 
@@ -97,17 +97,17 @@ namespace Antipatrea {
         commonParameters(*robot);
 
         switch (robot->getRobotState()) {
-            case Robot_config::NO_MAP_PLANNING:
+            case Robot_config::BLIND:
                 return handleNoMapPlanning(cmd_vel);
 
-            case Robot_config::NORMAL_PLANNING:
+            case Robot_config::NORMAL:
                 return handleNormalSpeedPlanning(cmd_vel, dt);
 
-            case Robot_config::LOW_SPEED_PLANNING:
+            case Robot_config::CAUTIOUS:
                 return handleLowSpeedPlanning(cmd_vel, dt);
 
             default:
-                return handleAbnormalPlaning(cmd_vel, dt);
+                return handleAbnormalPlanning(cmd_vel, dt);
         }
     }
 
@@ -141,7 +141,7 @@ namespace Antipatrea {
         double angular = std::clamp(normalizeAngle(angle_to_goal - parent_odom.theta_), -1.0, 1.0);
         angular = (angular > 0) ? std::max(angular, 0.1) : std::min(angular, -0.1);
 
-        publishCommand(cmd_vel, robot->max_vel_x, angular);
+        publishCommand(*robot, cmd_vel, robot->max_vel_x, angular);
         return true;
     }
 
@@ -153,7 +153,7 @@ namespace Antipatrea {
 
         if (!success) {
             std::cerr << "[WARN] " << "TEB planning failed, stopping");
-            publishCommand(cmd_vel, 0, 0);
+            publishCommand(*robot, cmd_vel, 0, 0);
         }
 
         return true;
@@ -167,64 +167,66 @@ namespace Antipatrea {
 
         if (!success) {
             std::cerr << "[WARN] " << "TEB planning failed, stopping");
-            publishCommand(cmd_vel, 0, 0);
+            publishCommand(*robot, cmd_vel, 0, 0);
         }
 
         return true;
     }
 
-    bool TEBPlanner::handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel, double dt) {
-        if (robot->getRobotState() == Robot_config::BRAKE_PLANNING) {
-            auto current_state = robot->getPoseStateSafe();
-            if (current_state.velocity_ > 0.01) {
-                publishCommand(cmd_vel, -0.1, 0.0);
+    bool TEBPlanner::handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel, double dt) {
+        if (robot->getRobotState() == Robot_config::BRAKE) {
+            auto current_state = robot->getPoseState();
+            if (current_state.vx_ > 0.01) {
+                publishCommand(*robot, cmd_vel, -0.1, 0.0);
             } else {
-                publishCommand(cmd_vel, 0.0, 0.0);
-                robot->setRobotState(Robot_config::RECOVERY);
+                publishCommand(*robot, cmd_vel, 0.0, 0.0);
+                robot->setRobotState(Robot_config::RECOVER);
             }
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::ROTATE_PLANNING) {
-            auto current_state = robot->getPoseStateSafe();
+        if (robot->getRobotState() == Robot_config::ROTATE) {
+            auto current_state = robot->getPoseState();
             double angle = normalizeAngle(robot->rotating_angle - current_state.theta_);
 
             if (fabs(angle) <= 0.10) {
-                robot->setRobotState(Robot_config::NORMAL_PLANNING);
+                robot->setRobotState(Robot_config::NORMAL);
                 return true;
             }
 
             double z = angle > 0 ? std::min(angle, 1.0) : std::max(angle, -1.0);
             z = z > 0 ? std::max(z, 0.5) : std::min(z, -0.5);
-            publishCommand(cmd_vel, 0.0, z);
+            publishCommand(*robot, cmd_vel, 0.0, z);
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::RECOVERY) {
-            double front_obs_snapshot, latter_obs_snapshot;
-            robot->getObstacleDistanceSafe(front_obs_snapshot, latter_obs_snapshot);
+        if (robot->getRobotState() == Robot_config::RECOVER) {
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            const double front_clear = dir_clearance[Robot_config::DIR_FRONT];
 
-            if (front_obs_snapshot <= 0.10) {
-                robot->setRobotState(Robot_config::BACKWARD);
+            if (front_clear <= 0.10) {
+                robot->setRobotState(Robot_config::BACK);
                 return true;
             }
 
             // Simple recovery: rotate in place
             robot->rotating_angle = normalizeAngle(parent_odom.theta_ + M_PI / 4);
-            robot->setRobotState(Robot_config::ROTATE_PLANNING);
+            robot->setRobotState(Robot_config::ROTATE);
             return true;
         }
 
-        if (robot->getRobotState() == Robot_config::BACKWARD) {
-            double front_obs_snapshot, latter_obs_snapshot;
-            robot->getObstacleDistanceSafe(front_obs_snapshot, latter_obs_snapshot);
+        if (robot->getRobotState() == Robot_config::BACK) {
+            std::array<double, Robot_config::DIR_SECTOR_COUNT> dir_clearance;
+            robot->getDirectionClearance(dir_clearance);
+            const double front_clear = dir_clearance[Robot_config::DIR_FRONT];
 
-            if (front_obs_snapshot >= 0.10) {
-                robot->setRobotState(Robot_config::RECOVERY);
+            if (front_clear >= 0.10) {
+                robot->setRobotState(Robot_config::RECOVER);
                 return true;
             }
 
-            publishCommand(cmd_vel, -0.3, 0);
+            publishCommand(*robot, cmd_vel, -0.3, 0);
         }
 
         return true;
@@ -242,7 +244,7 @@ namespace Antipatrea {
 
         // 2. Get current robot velocity
         geometry_msgs::msg::Twist robot_vel;
-        robot_vel.linear.x = parent_odom.velocity_;
+        robot_vel.linear.x = parent_odom.vx_;
         robot_vel.angular.z = parent_odom.angular_velocity_;
 
         // 3. Clear and rebuild obstacles
@@ -266,7 +268,7 @@ namespace Antipatrea {
         success = teb_planner_->getVelocityCommand(vx, vy, omega, 1);
 
         if (!success) {
-            std::cerr << "[WARN] " << "Failed to get velocity from TEB");
+            RCLCPP_WARN_THROTTLE(robot->get_logger(), *robot->get_clock(), 1000, "Failed to get velocity from TEB");
             return false;
         }
 
@@ -351,7 +353,7 @@ namespace Antipatrea {
     void TEBPlanner::buildObstacles() {
         // Get laser data (in baseline/robot frame)
         // Note: Already filtered in laserScanCallback (valid range + 1cm deduplication)
-        auto laser_points = robot->getLaserDataSafe();
+        auto laser_points = robot->getLaserData();
 
         double cos_theta = std::cos(parent_odom.theta_);
         double sin_theta = std::sin(parent_odom.theta_);
@@ -362,14 +364,14 @@ namespace Antipatrea {
 
         for (const auto &point : laser_points) {
             // Additional distance filter for TEB
-            double dist_sq = point.x() * point.x() + point.y() * point.y();
+            double dist_sq = point[0] * point[0] + point[1] * point[1];
             if (dist_sq > max_dist_sq) {
                 continue;  // Skip distant obstacles
             }
 
             // Transform from baseline to odom
-            double x_odom = parent_odom.x_ + (point.x() * cos_theta - point.y() * sin_theta);
-            double y_odom = parent_odom.y_ + (point.x() * sin_theta + point.y() * cos_theta);
+            double x_odom = parent_odom.x_ + (point[0] * cos_theta - point[1] * sin_theta);
+            double y_odom = parent_odom.y_ + (point[0] * sin_theta + point[1] * cos_theta);
 
             // Create point obstacle and add to container
             auto obs = boost::make_shared<teb_local_planner::PointObstacle>(x_odom, y_odom);
@@ -388,7 +390,6 @@ namespace Antipatrea {
 
         // Convert to PoseState for robot->viewTrajectories
         std::vector<PoseState> trajectory;
-        std::vector<double> time_diffs;
 
         for (const auto &traj_point : teb_trajectory) {
             PoseState state;
@@ -401,24 +402,18 @@ namespace Antipatrea {
             tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
             state.theta_ = yaw;
 
-            state.velocity_ = traj_point.velocity.linear.x;
+            state.vx_ = traj_point.velocity.linear.x;
             state.angular_velocity_ = traj_point.velocity.angular.z;
             state.valid_ = true;
             trajectory.push_back(state);
-
-            time_diffs.push_back(traj_point.time_from_start.toSec());
         }
 
-        if (!trajectory.empty() && !time_diffs.empty()) {
-            robot->viewTrajectories(trajectory, std::min(20, static_cast<int>(trajectory.size())), time_diffs);
+        if (!trajectory.empty()) {
+            robot->viewTrajectories(trajectory, std::min(20, static_cast<int>(trajectory.size())));
         }
     }
 
-    void TEBPlanner::publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular) {
-        cmd_vel.linear.x = linear;
-        cmd_vel.angular.z = angular;
-        robot->Control()->publish(cmd_vel);
-    }
+    // publishCommand 已统一到 LocalPlannerBase(static)，TEBPlanner 不再保留副本。
 
     double TEBPlanner::normalizeAngle(double angle) {
         while (angle > M_PI) angle -= 2 * M_PI;

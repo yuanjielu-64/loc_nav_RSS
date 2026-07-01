@@ -32,7 +32,7 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.4
+      desired_linear_vel: 2.0
       lookahead_dist: 0.6
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.9
@@ -56,7 +56,7 @@ local_costmap:
   local_costmap:
     ros__parameters:
       update_frequency: 5.0
-      publish_frequency: 2.0
+      publish_frequency: 5.0
       transform_tolerance: 0.3
       global_frame: odom
       robot_base_frame: base_link
@@ -68,15 +68,17 @@ local_costmap:
       # Go2 机身约 0.70x0.31m，按对称矩形(以 base_link 为中心)近似，
       # 留腿摆动/安全裕度 -> 0.72x0.36m。外接半径约 0.40m。
       footprint: "[ [0.36, 0.18], [0.36, -0.18], [-0.36, -0.18], [-0.36, 0.18] ]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      # 单线 2D 激光用 ObstacleLayer 而非 VoxelLayer：射线穿过即清除 2D 栅格，
+      # 清障更彻底；VoxelLayer 是给 3D 用的，单线扫描下旧障碍清不掉、四周糊成
+      # 一圈拖影(就是 RViz 里看到的"不更新")。与 global_costmap 保持一致。
+      plugins: ["obstacle_layer", "inflation_layer"]
 
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: False
         observation_sources: scan
         scan:
-          topic: /front/scan
+          topic: /front/scan_filter
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -102,11 +104,12 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: false
       rolling_window: true
-      # 窗口从 40x40 缩到 14x14：odom 帧里里程计会漂移，大窗口会让旧障碍
-      # 一直累积、拖影、清不掉（截图里糊成一片的原因）。缩小窗口让远处的
-      # 陈旧杂点随窗口滚出而丢弃，只保留近处可靠障碍，/plan 更干净。
-      width: 20
-      height: 20
+      # rolling_window=true：costmap 是【以机器人为中心、跟着机器人滚动】的窗口，
+      # 机器人可无限远地一直移动，窗口只需覆盖前方一段路即可，不必铺满世界。
+      # 用 30x30(跟随)而非 1000x1000(铺满)：后者每边1万格=1亿格/层，必然卡死。
+      # odom 帧漂移下窗口也别太大，否则远处旧障碍累积拖影、清不掉。
+      width: 30
+      height: 30
       resolution: 0.10
       track_unknown_space: false
       # Go2 机身约 0.70x0.31m，按对称矩形(以 base_link 为中心)近似，
@@ -114,14 +117,16 @@ global_costmap:
       footprint: "[ [0.36, 0.18], [0.36, -0.18], [-0.36, -0.18], [-0.36, 0.18] ]"
       # 单线 2D 激光用 ObstacleLayer 而非 VoxelLayer：射线穿过即清除 2D 栅格，
       # 清障更彻底；VoxelLayer 是给 3D 用的，单线扫描下容易残留旧障碍。
-      plugins: ["obstacle_layer", "inflation_layer"]
+      # denoise_layer 夹在 obstacle 与 inflation 之间：删掉单线噪声激光留下的
+      # 孤立/小簇噪点格(椒盐噪声)，再做膨胀，避免噪点被 inflation 放大成大块。
+      plugins: ["obstacle_layer", "denoise_layer", "inflation_layer"]
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         observation_sources: scan
         scan:
-          topic: /front/scan
+          topic: /front/scan_filter
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -133,11 +138,19 @@ global_costmap:
           obstacle_max_range: 4.5
           obstacle_min_range: 0.0
 
+      # 去噪层：把 obstacle 层标出的格子里【孤立或小于 minimal_group_size 的连通簇】
+      # 当作噪点清掉(8 邻接)。单线 HESAI 偶发的散点不会再积累成永久杂块。
+      denoise_layer:
+        plugin: "nav2_costmap_2d::DenoiseLayer"
+        enabled: True
+        minimal_group_size: 2
+        group_connectivity_type: 8
+
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        # 外接半径约 0.40m + ~10cm 裕度 = 0.50（兼顾安全与钻缝能力）
-        inflation_radius: 0.60
+        # 外接半径约 0.40m，inflation 取 0.40（0.60 过大，改小以便钻缝）
+        inflation_radius: 0.40
 
 planner_server:
   ros__parameters:
@@ -145,10 +158,23 @@ planner_server:
     expected_planner_frequency: 1.0
     planner_plugins: ["GridBased"]
     GridBased:
-      plugin: "nav2_navfn_planner/NavfnPlanner"
-      tolerance: 0.5
-      use_astar: false
-      allow_unknown: true
+      # SmacPlanner2D：2D 任意角 A* + 平滑，适合 Go2(可原地转向，无转弯半径约束)。
+      # 想换回 NavFn 时把 plugin 改回 "nav2_navfn_planner/NavfnPlanner" + tolerance/use_astar/allow_unknown 即可。
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.5                      # 到不了精确目标时允许的最近距离(m)
+      downsample_costmap: false           # 不降采样 costmap
+      downsampling_factor: 1
+      allow_unknown: true                 # 允许穿过未知区域(map-less rolling costmap 需要)
+      max_iterations: 1000000             # A* 最大迭代(防卡死)
+      max_on_approach_iterations: 1000    # 接近目标时的额外迭代
+      max_planning_time: 2.0              # 单次规划超时(s)
+      cost_travel_multiplier: 2.0         # 越大越避开高代价(贴障碍)区域
+      use_final_approach_orientation: false
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
 
 smoother_server:
   ros__parameters:
@@ -217,8 +243,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [0.4, 0.3, 0.6]
-    min_velocity: [-0.4, -0.3, -0.6]
+    max_velocity: [2.0, 0.3, 0.6]
+    min_velocity: [-2.0, -0.3, -0.6]
     max_accel: [2.5, 2.5, 3.2]
     max_decel: [-2.5, -2.5, -3.2]
     odom_topic: "odom"

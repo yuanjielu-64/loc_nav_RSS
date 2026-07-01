@@ -18,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <geometry_msgs/msg/twist.hpp>
 
 namespace Antipatrea {
 
@@ -40,6 +41,7 @@ namespace Antipatrea {
 
         // 公共的速度/角速度动态窗口(各 planner 原 Window 字段一致，提到基类)。
         // show() 仅 DDP 历史上有定义，提到基类供需要时调用，行为不变。
+        // 新增 min/max_lateral_velocity_：全向(Go2)侧移速度窗口；差速 planner 不读，保持 0。
         class Window {
         public:
             Window();
@@ -50,6 +52,8 @@ namespace Antipatrea {
             double max_velocity_;
             double min_angular_velocity_;
             double max_angular_velocity_;
+            double min_lateral_velocity_;   // 全向侧移窗口下限(差速 planner 不用)
+            double max_lateral_velocity_;   // 全向侧移窗口上限(差速 planner 不用)
         };
 
         // 公共的轨迹代价结构(各 planner 原 Cost 字段几乎一致，DDP 多 space_cost_)。
@@ -97,17 +101,31 @@ namespace Antipatrea {
         // 角速度代价：use_angular_cost_ 开启时返回 |w|^2，否则 0。各 planner 完全一致。
         double calc_angular_velocity(const std::vector<PoseState> &traj) const;
 
-        // 通用初始化：从 Robot_config 取 dt + 默认加减速度常量 + local_goal。
+        // 通用初始化：从 Robot_config 取 dt + 默认加减速度常量 + local_goal_odom。
         // 5 个 planner 原 commonParameters 字节级一致，统一到基类。
         // 各 planner 主循环每次 solve 前调用一次。
         void commonParameters(Robot_config &robot);
+
+        // 通用下发：构造 Twist + 发到 /cmd_vel(robot->Control())。原各 planner 各抄一份，统一到此。
+        //   2 参重载：差速(linear.x + angular.z)，linear.y 强制 0。
+        //   3 参重载：全向(vx/vy/w)，并节流打印 [cmd][状态] 日志便于联调。
+        static void publishCommand(Robot_config &robot, geometry_msgs::msg::Twist &cmd_vel,
+                                   double linear, double angular);
+        static void publishCommand(Robot_config &robot, geometry_msgs::msg::Twist &cmd_vel,
+                                   double vx, double vy, double angular);
+
+        // 通用动态窗口：基于当前状态 + 加减速度常量 + 桥速度限制，算 vx/w/vy 三轴可达区间。
+        // 原 4 个 planner(DDP/DWA_DDP/MPPI_DDP/MPPI) 各抄一份(MPPI 少 vy 段，其它 4 份一致)，
+        // 统一到基类。DWAPlanner 因签名不同(只传 state、从 robot->dt 取 dt、用 parent.* 而非 state.*)
+        // 仍保留自己的版本，不影响。
+        Window calc_dynamic_window(Robot_config &robot, const PoseState &state, double dt) const;
 
         // 是否启用角速度代价(由各 planner 的 *Parameters 设置)。原本每个 planner 各有一份，
         // 现统一到基类，calc_angular_velocity 直接用。
         bool use_angular_cost_ = false;
 
         // ---- 通用运动/求解状态(原各 planner 重复，提到基类) ----
-        std::vector<double> local_goal;   // 当前 local goal(odom 帧 x,y)，commonParameters 设置
+        std::vector<double> local_goal_odom;   // 当前 local goal(odom 帧 x,y)，commonParameters 设置
         double dt{};                       // 控制 dt(从 Robot_config 取)
         double minAccelerSpeed{};          // 加减速度常量(commonParameters 设置)
         double maxAccelerSpeed{};

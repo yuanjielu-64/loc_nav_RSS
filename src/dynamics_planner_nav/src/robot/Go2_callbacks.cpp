@@ -1,100 +1,73 @@
 // Go2_callbacks.cpp — ROS2 callback implementations
 #include "Go2_callbacks.hpp"
 #include "Go2.hpp"
+#include "Utility.hpp"   // transform_lg(world→base_link)（goalCallback 仍用）
+#include "../globalPlanners/GlobalPathHandler.hpp"   // /plan 处理实体(valid/empty)
+#include "../perception/LaserScanProcessor.hpp"      // 一帧激光的总处理(odom 点 + 8 方向余量)
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <unordered_set>
 
 Go2Callbacks::Go2Callbacks(Robot_config* robot)
     : robot_(robot) {
 }
 
 void Go2Callbacks::odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    if (!robot_) return;
+    const auto& p  = msg->pose.pose.position;
+    const auto& q  = msg->pose.pose.orientation;
+    const auto& tw = msg->twist.twist;
 
-    double cur_x, cur_y;
+    // 四元数 -> yaw（绕 z 的旋转）
+    const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+    const double yaw = std::atan2(siny_cosp, cosy_cosp);
+
     {
         std::lock_guard<std::mutex> lock(robot_->robot_state_mutex_);
-        robot_->robot_state.x_ = msg->pose.pose.position.x;
-        robot_->robot_state.y_ = msg->pose.pose.position.y;
-
-        // Extract yaw from quaternion
-        double siny_cosp = 2.0 * (msg->pose.pose.orientation.w * msg->pose.pose.orientation.z +
-                                  msg->pose.pose.orientation.x * msg->pose.pose.orientation.y);
-        double cosy_cosp = 1.0 - 2.0 * (msg->pose.pose.orientation.y * msg->pose.pose.orientation.y +
-                                        msg->pose.pose.orientation.z * msg->pose.pose.orientation.z);
-        robot_->robot_state.theta_ = std::atan2(siny_cosp, cosy_cosp);
-
-        robot_->robot_state.velocity_ = msg->twist.twist.linear.x;
-        robot_->robot_state.angular_velocity_ = msg->twist.twist.angular.z;
+        robot_->robot_state.x_ = p.x;
+        robot_->robot_state.y_ = p.y;
+        robot_->robot_state.theta_ = yaw;
+        robot_->robot_state.vx_ = tw.linear.x;
+        robot_->robot_state.vy_ = tw.linear.y;
+        robot_->robot_state.angular_velocity_ = tw.angular.z;
         robot_->robot_state.valid_ = true;
-
-        cur_x = robot_->robot_state.x_;
-        cur_y = robot_->robot_state.y_;
-    }  // 先释放 robot_state_mutex_，再去拿 path_goal_mutex_，避免与
-       // processValidGlobalPath(先 path_goal_mutex_ 再 robot_state_mutex_) 形成反向加锁死锁。
-
-    // 到达判定：离 global goal 1m 内即视为到达，停止规划，防止在目标附近一直打转。
-    checkGoalReached(cur_x, cur_y);
-}
-
-void Go2Callbacks::checkGoalReached(double cur_x, double cur_y) {
-    std::lock_guard<std::mutex> lock(robot_->path_goal_mutex_);
-
-    // 还没有全局目标就不判定
-    if (!robot_->global_goal_received || robot_->global_goal.size() < 2) return;
-
-    const double dx = robot_->global_goal[0] - cur_x;
-    const double dy = robot_->global_goal[1] - cur_y;
-    const double dist = std::sqrt(dx * dx + dy * dy);
-
-    if (dist <= robot_->goal_reached_threshold) {
-        if (!robot_->goal_reached) {
-            RCLCPP_INFO(robot_->get_logger(),
-                "到达 global goal (距离 %.2fm <= %.2fm)，停止规划，等待新目标。",
-                dist, robot_->goal_reached_threshold);
-        }
-        robot_->goal_reached = true;
-        // 让 setup() 不再放行 -> DDP 不发 /cmd_vel -> 桥看门狗 0.5s 后停狗。
-        robot_->local_goal_received = false;
     }
 }
 
 void Go2Callbacks::laserScanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-    if (!robot_) return;
+    // 整段激光处理(极坐标→odom 点 + 8 方向边缘余量)已抽到 perception::processLaserScan，
+    // 回调只负责：取位姿/轮廓模型 → 调用 → 把结果加锁写回 Robot_config。
+    // 用【激光那一帧时间戳】对应的位姿(TF odom→base_link@stamp)，而不是最新位姿——
+    // 否则运动/转弯时会用新位姿变换旧激光，导致激光点整体偏移(致命)。
+    const auto pose = robot_->getPoseStateAt(msg->header.stamp);
+    const auto dynamic_models = robot_->checkVolumeReady()
+        ? robot_->getDynamicVolumes() : std::vector<go2::Footprint>{};
 
-    std::lock_guard<std::mutex> lock(robot_->laser_data_mutex_);
-    robot_->laserData.clear();
-    robot_->laserDataDistance.clear();
+    auto scan_result = perception::processLaserScan(
+        *msg, pose.x_, pose.y_, pose.theta_,
+        dynamic_models, robot_->getStaticVolumes());
 
-    const auto& pose = robot_->getPoseState();
+    // 把 perception 处理后的激光点(odom 系)发到 /perception/laser_points，供 RViz 核对。
+    // 在 move 入库前用本地结果发布，避免读已被 move 走/竞争的 laserData_odom。
+    robot_->viewLaserPoints(scan_result.points_odom);
 
-    // 过滤掉离机器人太近的激光点：Go2 的 3D lidar 转 2D 后会把狗自己的腿/身体当作障碍，
-    // 这些点（实测有 ~170 个在 0.5m 内、其中 3 个 < 0.3m）会让 DDP 把每条候选轨迹都判为撞障，
-    // 导致 "No available trajectory after cleaning"。SELF_FILTER 半径取 0.30m，对应狗自身
-    // 占地的外包圆(机身 0.72×0.36 → 半对角 ≈0.40m，留点裕度过滤稍紧到 0.30m，避免把真实近障也滤掉)。
-    constexpr float SELF_FILTER_RANGE = 0.30f;
-
-    for (size_t i = 0; i < msg->ranges.size(); ++i) {
-        float range = msg->ranges[i];
-        if (range < msg->range_min || range > msg->range_max || std::isnan(range) || std::isinf(range)) {
-            continue;
-        }
-        if (range < SELF_FILTER_RANGE) {
-            continue;  // 视为机器人自身回波
-        }
-
-        float angle = msg->angle_min + i * msg->angle_increment;
-        float global_angle = angle + static_cast<float>(pose.theta_);
-
-        float x = static_cast<float>(pose.x_) + range * std::cos(global_angle);
-        float y = static_cast<float>(pose.y_) + range * std::sin(global_angle);
-
-        robot_->laserData.emplace_back(x, y);
-        robot_->laserDataDistance.push_back(static_cast<double>(range));
+    {
+        std::lock_guard<std::mutex> lock(robot_->laser_data_mutex_);
+        robot_->laserData_odom    = std::move(scan_result.points_odom);
+        robot_->laserDataDistance = std::move(scan_result.ranges);
+    }
+    {
+        std::lock_guard<std::mutex> olock(robot_->obstacle_mutex_);
+        robot_->direction_clearance_ = scan_result.direction_clearance;
     }
 }
 
 void Go2Callbacks::costmapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-    if (!robot_) return;
+    // 当前规划只用激光，costmapData 无人消费；不开关就别白遍历整张栅格。
+    // 将来启用 BACK 倒车用 costmap 时把 robot_->use_costmap_ 置 true 即可。
+    if (!robot_->use_costmap_) return;
 
     // Costmap callback - store obstacle cells
     robot_->costmapData.clear();
@@ -117,108 +90,30 @@ void Go2Callbacks::costmapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr
 }
 
 void Go2Callbacks::globalPathCallback(const nav_msgs::msg::Path::SharedPtr msg) {
-    if (!robot_) return;
-
-    if (msg->poses.empty()) {
-        handleEmptyGlobalPath();
-        return;
-    }
-
-    processValidGlobalPath(msg);
+    // /plan 的处理实体已抽到 globalPlanners/GlobalPathHandler，这里只按是否空路径分流。
+    if (msg->poses.empty())
+        GlobalPathHandler::processEmptyGlobalPath(robot_);
+    else
+        GlobalPathHandler::processValidGlobalPath(robot_, msg);
 }
 
-bool Go2Callbacks::handleEmptyGlobalPath() {
-    robot_->setRobotState(Robot_config::BRAKE_PLANNING);
-    return false;
-}
-
-void Go2Callbacks::processValidGlobalPath(const nav_msgs::msg::Path::SharedPtr msg) {
-    std::lock_guard<std::mutex> lock(robot_->path_goal_mutex_);
-
-    robot_->global_paths.clear();
-    robot_->global_paths_odom.clear();
-
-    for (const auto& pose : msg->poses) {
-        std::vector<double> point = {pose.pose.position.x, pose.pose.position.y};
-        robot_->global_paths.push_back(point);
-        robot_->global_paths_odom.push_back(point);
-    }
-
-    // Set local goal from path
-    if (!msg->poses.empty()) {
-        // 已到达 global goal：保持停止，不再用 /plan 重新激活 local_goal_received，
-        // 否则 2Hz 的 /plan 会立刻把刚到达时清掉的标志重新置位，狗又动起来打转。
-        if (robot_->goal_reached) {
-            robot_->local_goal_received = false;
-        } else {
-            double threshold = computeLookaheadThreshold();
-            const auto& current_pose = robot_->getPoseState();
-
-            bool found = false;
-            for (const auto& pose : msg->poses) {
-                double dx = pose.pose.position.x - current_pose.x_;
-                double dy = pose.pose.position.y - current_pose.y_;
-                double dist = std::sqrt(dx * dx + dy * dy);
-
-                if (dist >= threshold) {
-                    robot_->local_goal = {pose.pose.position.x, pose.pose.position.y};
-                    // /plan 已是 odom 帧，local_goal 本身即 odom 坐标，保持 odom 版一致
-                    robot_->local_goal_odom = robot_->local_goal;
-                    robot_->local_goal_received = true;
-                    found = true;
-                    break;
-                }
-            }
-
-            // If no point far enough, use last point
-            if (!found) {
-                const auto& last = msg->poses.back();
-                robot_->local_goal = {last.pose.position.x, last.pose.position.y};
-                robot_->local_goal_odom = robot_->local_goal;
-                robot_->local_goal_received = true;
-            }
-
-            // 收到有效全局路径且里程计已就绪时，离开 INITIALIZING 进入正常规划
-            // （否则状态机会永远卡在 INITIALIZING，setup() 永远回不了 true）
-            if (robot_->getRobotState() == Robot_config::INITIALIZING &&
-                robot_->getPoseState().valid_) {
-                robot_->setRobotState(Robot_config::NORMAL_PLANNING);
-            }
-        }
-    }
-
-    // 每收到一条有效 /plan 就发布目标可视化(odom 帧)：local_goal 绿、global_goal 红。
-    // 此处已持有 path_goal_mutex_，view_Goal 内部只发 Marker、不加锁，安全。
-    robot_->view_Goal(robot_->local_goal_odom, robot_->global_goal_odom);
-}
-
-double Go2Callbacks::computeLookaheadThreshold() const {
-    return robot_->local_goal_distance;  // Use local_goal_distance parameter
-}
 
 void Go2Callbacks::timeIntervalCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-    if (!robot_) return;
-
     std::lock_guard<std::mutex> lock(robot_->timeInterval_mutex_);
     robot_->timeInterval.clear();
     robot_->timeInterval.assign(msg->data.begin(), msg->data.end());
 }
 
 void Go2Callbacks::paramsCallback(const std_msgs::msg::String::SharedPtr msg) {
-    if (!robot_) return;
     robot_->param_received = true;
-    // Parse parameters from string if needed
-    // Format could be JSON or key=value pairs
     (void)msg;  // TODO: Implement parameter parsing if needed
 }
 
 void Go2Callbacks::goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-    if (!robot_) return;
-
     std::lock_guard<std::mutex> lock(robot_->path_goal_mutex_);
-    robot_->global_goal.clear();
-    robot_->global_goal.push_back(msg->pose.position.x);
-    robot_->global_goal.push_back(msg->pose.position.y);
+
+    const double gx = msg->pose.position.x;
+    const double gy = msg->pose.position.y;
 
     // Extract yaw from quaternion
     double siny_cosp = 2.0 * (msg->pose.orientation.w * msg->pose.orientation.z +
@@ -226,19 +121,38 @@ void Go2Callbacks::goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr
     double cosy_cosp = 1.0 - 2.0 * (msg->pose.orientation.y * msg->pose.orientation.y +
                                     msg->pose.orientation.z * msg->pose.orientation.z);
     double yaw = std::atan2(siny_cosp, cosy_cosp);
-    robot_->global_goal.push_back(yaw);
-    // /goal_pose 已是 odom 帧，global_goal 本身即 odom 坐标，保持 odom 版一致，
-    // 否则 view_Goal 里 goal1.size()<2 会导致红色全局目标 Marker 永远不发布。
-    robot_->global_goal_odom = robot_->global_goal;
+
+    const auto rp = robot_->getPoseState();
+    auto body = transform_lg(gx, gy, rp.x_, rp.y_, rp.theta_);
+    const double yaw_body = std::atan2(std::sin(yaw - rp.theta_), std::cos(yaw - rp.theta_));
+
+    robot_->global_goal = {body[0], body[1], yaw_body};
+    robot_->global_goal_odom = {gx, gy, yaw};
     robot_->global_goal_received = true;
-    // 收到新目标 -> 复位到达标志，重新开始规划。
-    robot_->goal_reached = false;
+    robot_->global_goal_reached = false;
+    robot_->local_goal_received = false;
+
+    robot_->setRobotState(Robot_config::NORMAL);
 }
 
 void Go2Callbacks::velocityCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    if (!robot_) return;
-
-    std::lock_guard<std::mutex> lock(robot_->robot_state_mutex_);
-    robot_->robot_state.velocity_ = msg->twist.twist.linear.x;
-    robot_->robot_state.angular_velocity_ = msg->twist.twist.angular.z;
+    {
+        std::lock_guard<std::mutex> lock(robot_->robot_state_mutex_);
+        robot_->robot_state.vx_ = msg->twist.twist.linear.x;
+        robot_->robot_state.vy_ = msg->twist.twist.linear.y;   // 全向：机体侧向速度
+        robot_->robot_state.angular_velocity_ = msg->twist.twist.angular.z;
+    }
+    // 速度状态机(NORMAL/CAUTIOUS/BRAKE 自动切换)：实现见 Go2_prepare.cpp。
+    robot_->updateSpeedStateMachine(std::fabs(msg->twist.twist.linear.x));
 }
+
+void Go2Callbacks::robotVolumeCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+    auto parsed = go2::Footprint::parseFootprints(*msg);
+    if (parsed.empty()) return;   // 空/无效消息：保留上一帧，不覆盖
+    {
+        std::lock_guard<std::mutex> lock(robot_->volumes_mutex_);
+        robot_->models_dynamic_ = std::move(parsed);
+    }
+    robot_->volume_received = true;
+}
+

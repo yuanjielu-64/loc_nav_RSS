@@ -33,9 +33,9 @@ class CmdVelToSport(Node):
 
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('sport_topic', '/api/sport/request')
-        self.declare_parameter('max_x', 0.4)        # m/s forward/back (gentle default for testing)
-        self.declare_parameter('max_y', 0.3)        # m/s strafe
-        self.declare_parameter('max_yaw', 0.6)      # rad/s turn
+        self.declare_parameter('max_x', 1.0)        # m/s forward/back
+        self.declare_parameter('max_y', 1.0)        # m/s strafe(同 max_x：planner 已限准，桥不再当瓶颈)
+        self.declare_parameter('max_yaw', 3.0)      # rad/s turn
         self.declare_parameter('cmd_timeout', 0.5)  # s; stop if no cmd
 
         cmd_vel_topic = self.get_parameter('cmd_vel_topic').value

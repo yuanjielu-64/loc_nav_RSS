@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 # misc
 *.log
+# scratch / generated artifacts
+**/tmp/
+src/dynamics_planner_nav/scripts/obstacle_cost.png

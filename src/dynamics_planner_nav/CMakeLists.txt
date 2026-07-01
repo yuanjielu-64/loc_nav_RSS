@@ -50,6 +50,7 @@ include_directories(
 file(GLOB ROBOT_SOURCES CONFIGURE_DEPENDS src/robot/*.cpp)
 file(GLOB LOCAL_PLANNER_SOURCES CONFIGURE_DEPENDS src/localPlanners/*.cpp)
 file(GLOB GLOBAL_PLANNER_SOURCES CONFIGURE_DEPENDS src/globalPlanners/*.cpp)
+file(GLOB PERCEPTION_SOURCES CONFIGURE_DEPENDS src/perception/*.cpp)
 file(GLOB UTILS_SOURCES CONFIGURE_DEPENDS src/utils/*.cpp)
 
 # Exclude collision_publisher.cpp from UTILS_SOURCES (it's a separate executable)
@@ -86,6 +87,7 @@ add_executable(${PROJECT_NAME}_node
   ${ROBOT_SOURCES}
   ${LOCAL_PLANNER_SOURCES}
   ${GLOBAL_PLANNER_SOURCES}
+  ${PERCEPTION_SOURCES}
   ${UTILS_SOURCES}
 )
 
@@ -103,6 +105,7 @@ add_executable(${PROJECT_NAME}_switch_node
   ${ROBOT_SOURCES}
   ${LOCAL_PLANNER_SOURCES}
   ${GLOBAL_PLANNER_SOURCES}
+  ${PERCEPTION_SOURCES}
   ${UTILS_SOURCES}
 )
 
@@ -121,7 +124,7 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# Install launch files
+# Install launch / config / rviz (仿真资源 description/worlds 已移除)
 install(DIRECTORY
   launch
   config

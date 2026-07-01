@@ -9,7 +9,10 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_share = get_package_share_directory('dynamics_planner_nav')
     # Declare arguments
-    use_sim_time = LaunchConfiguration('use_sim_time', default='true')
+    # 真机(Unitree Go2)运行：订阅 /utlidar/robot_odom 真实里程计、无 Gazebo /clock。
+    # 必须用墙钟，否则节点等 /clock 而 TF(base_link 由狗端 robot_state_publisher 用墙钟/
+    # 单调时钟打戳)时间源不一致 → TF_OLD_DATA "data from the past"。仿真时显式传 true 覆盖。
+    use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     planner = LaunchConfiguration('planner', default='DWA')
     # Dynamics planner navigation node
     dynamics_planner_node = Node(
@@ -30,8 +33,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_sim_time',
-            default_value='true',
-            description='Use simulation clock if true'
+            default_value='false',
+            description='Use simulation clock if true. 真机务必 false(无 /clock)；仅 Gazebo 仿真传 true。'
         ),
         DeclareLaunchArgument(
             'planner',

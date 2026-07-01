@@ -98,7 +98,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': use_sim_time,
-                'rate': 2.0,
+                'rate': 5.0,
                 'planner_id': 'GridBased',
             }],
         ),

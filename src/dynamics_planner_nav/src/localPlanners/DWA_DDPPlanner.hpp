@@ -60,10 +60,10 @@ namespace Antipatrea {
         virtual bool handleLowSpeedPlanning(geometry_msgs::msg::Twist &cmd_vel,
                                             std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
-        virtual bool handleAbnormalPlaning(geometry_msgs::msg::Twist &cmd_vel,
+        virtual bool handleAbnormalPlanning(geometry_msgs::msg::Twist &cmd_vel,
                                            std::pair<std::vector<PoseState>, bool> &best_traj, double dt);
 
-        virtual void publishCommand(geometry_msgs::msg::Twist &cmd_vel, double linear, double angular);
+        // publishCommand 已统一到 LocalPlannerBase(static)，调用 publishCommand(*robot, cmd_vel, ...)。
 
         virtual double recover(PoseState &state, PoseState &state_odom,
                                std::pair<std::vector<PoseState>, bool> &best_traj, bool &results);
@@ -75,14 +75,14 @@ namespace Antipatrea {
             PoseState &state, PoseState &state_odom, double angular_velocity);
 
         virtual std::pair<std::vector<PoseState>, std::vector<PoseState> > generateTrajectory(
-            PoseState &state, PoseState &state_odom, double v, double w);
+            PoseState &state, PoseState &state_odom, double vx, double vy, double w);
 
 
-        virtual void motion(PoseState &state, double velocity, double angular_velocity, double t);
+        virtual void motion(PoseState &state, double vx, double vy, double angular_velocity, double t);
 
         virtual void process_segment(int thread_id, int start, int end, PoseState &state, PoseState &state_odom,
                                      double velocity_resolution,
-                                     double angularVelocity_resolution, Window &dw,
+                                     double angularVelocity_resolution, double lateral_resolution, Window &dw,
                                      std::vector<Cost> &thread_costs,
                                      std::vector<std::pair<std::vector<PoseState>, std::vector<PoseState> > > &
                                      thread_trajectories);
@@ -110,7 +110,6 @@ namespace Antipatrea {
 
         virtual double calc_dist_to_path(const std::vector<double> &state);
 
-        virtual Window calc_dynamic_window(PoseState &state, double dt);
 
 
         virtual double calculateDistanceToCarEdge(
@@ -126,13 +125,15 @@ namespace Antipatrea {
         double angle_to_goal_ = M_PI / 2;
 
         double robot_radius_ = 0.03;
-        double distance = 0.0;
+        // 候选轨迹被接受所需的最小行进距离(总弧长下限)；轨迹太短则判无效。原名 distance。
+        double min_traj_length_ = 0.0;
 
         int num_threads;
         double obs_range_ = 4;
         int nr_steps_ = 20;
         int v_steps_ = 20;
         int w_steps_ = 20;
+        int vy_steps_ = 3;   // 全向侧移网格档数(含 0；如 -max,0,+max)。差速时设 1。
 
         PoseState parent;
         PoseState parent_odom;
